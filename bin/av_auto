@@ -9,6 +9,8 @@
 # A catalog code is never a subcommand: `av_auto ABP-073 clean` stops here.
 # set -e must not skip av_auto_apply_fs when python exits non-zero. Pending
 # mkdir/write_text jobs are how strm lands after shfs returns ENOSPC.
+# --url (ed2k uses '|') is never placed raw on the ssh command line. The remote
+# shell would split it. The value goes to a mode-600 file and comes back as "$URI".
 set -euo pipefail
 
 # Keep in sync with looks_like_catalog_code() / code_as_command_message() in scripts/av_auto.py.
@@ -41,6 +43,50 @@ if ((${#cmd_tokens[@]})) && is_catalog_code "${cmd_tokens[0]}"; then
   done
   echo "ERROR: '${codes[0]}' 是番号，不是子命令。不要把番号放在子命令前面（av_auto ${cmd_tokens[*]}）。115 离线完成后请用: av_auto process ${codes[*]}（不交磁、不刮削、不 promote）" >&2
   exit 2
+fi
+
+# Pull --url out of the forwarded argv before any ssh. Do not echo the value.
+HAS_URL=0
+URL_VALUE=""
+LOCAL_URL_FILE=""
+REMOTE_URL_FILE=""
+FORWARD=()
+argv=("$@")
+i=0
+while (( i < ${#argv[@]} )); do
+  token="${argv[$i]}"
+  if [[ "$token" == "--url" ]]; then
+    if (( i + 1 >= ${#argv[@]} )); then
+      FORWARD+=("--url")
+      i=$((i + 1))
+      continue
+    fi
+    if [[ "$HAS_URL" == 1 ]]; then
+      echo "ERROR: 只接受一个 --url（不打印链接）。" >&2
+      exit 2
+    fi
+    URL_VALUE="${argv[$((i + 1))]}"
+    HAS_URL=1
+    i=$((i + 2))
+    continue
+  fi
+  if [[ "$token" == --url=* ]]; then
+    if [[ "$HAS_URL" == 1 ]]; then
+      echo "ERROR: 只接受一个 --url（不打印链接）。" >&2
+      exit 2
+    fi
+    URL_VALUE="${token#--url=}"
+    HAS_URL=1
+    i=$((i + 1))
+    continue
+  fi
+  FORWARD+=("$token")
+  i=$((i + 1))
+done
+if ((${#FORWARD[@]})); then
+  set -- "${FORWARD[@]}"
+else
+  set --
 fi
 
 # Read-only probe of the Unraid host. Does not reload shfs and does not write.
@@ -139,11 +185,80 @@ cleanup_llm() {
   ssh -o BatchMode=yes root@192.168.1.9 "rm -f -- ${LLM_DST}" || true
 }
 
+cleanup_local_url() {
+  if [ -z "${LOCAL_URL_FILE:-}" ]; then
+    return 0
+  fi
+  rm -f -- "$LOCAL_URL_FILE"
+  LOCAL_URL_FILE=""
+}
+
+cleanup_remote_url() {
+  if [ -z "${REMOTE_URL_FILE:-}" ]; then
+    return 0
+  fi
+  # The remote script deletes this file too. Never echo the URL.
+  ssh -o BatchMode=yes root@192.168.1.9 "rm -f -- $(printf '%q' "$REMOTE_URL_FILE")" || true
+  REMOTE_URL_FILE=""
+}
+
+cleanup_on_exit() {
+  cleanup_llm
+  cleanup_local_url
+  cleanup_remote_url
+}
+
+# ed2k '|' and magnet '&' must not reach the remote shell as syntax.
+# Write the URL to a mode-600 file, then docker exec --url "$URI".
+run_python_remote() {
+  if [ "$HAS_URL" != 1 ]; then
+    ssh -o BatchMode=yes root@192.168.1.9 docker exec "${docker_env[@]}" moviepilot python3 /config/scripts/av_auto.py "$@"
+    return $?
+  fi
+  LOCAL_URL_FILE=$(mktemp) || return $?
+  chmod 600 "$LOCAL_URL_FILE" || return $?
+  printf '%s' "$URL_VALUE" > "$LOCAL_URL_FILE" || return $?
+  unset URL_VALUE
+  REMOTE_URL_FILE="/tmp/av-auto-url.${RANDOM}-$$-$(date +%s)"
+  remote_cmd="umask 077; cat > $(printf '%q' "$REMOTE_URL_FILE") && chmod 600 $(printf '%q' "$REMOTE_URL_FILE")"
+  ssh -o BatchMode=yes root@192.168.1.9 "$remote_cmd" < "$LOCAL_URL_FILE"
+  up_rc=$?
+  rm -f -- "$LOCAL_URL_FILE"
+  LOCAL_URL_FILE=""
+  if [ "$up_rc" -ne 0 ]; then
+    echo "ERROR: 未能把 --url 写到 Unraid 临时文件（不打印链接）。" >&2
+    return "$up_rc"
+  fi
+  # Trailing space from '%q ' keeps the next token a separate word.
+  env_q=$(printf '%q ' "${docker_env[@]}")
+  args_q=""
+  if (( $# )); then
+    args_q=$(printf '%q ' "$@")
+  fi
+  remote_q=$(printf '%q' "$REMOTE_URL_FILE")
+  ssh -o BatchMode=yes root@192.168.1.9 bash -s <<REMOTE
+set -euo pipefail
+url_file=${remote_q}
+cleanup() { rm -f -- "\$url_file"; }
+trap cleanup EXIT
+if [[ ! -f "\$url_file" ]]; then
+  echo "ERROR: 未能读取 --url（不打印链接）。" >&2
+  exit 1
+fi
+chmod 600 "\$url_file"
+URI=\$(cat "\$url_file")
+rm -f -- "\$url_file"
+docker exec ${env_q}moviepilot python3 /config/scripts/av_auto.py ${args_q}--url "\$URI"
+REMOTE
+}
+
 if [ "$need_llm" = 1 ]; then
   run_id="${RANDOM}-$$-$(date +%s)"
   LLM_DST="/mnt/user/appdata/moviepilot/config/scripts/av-auto-fs/llm_runtime.${run_id}.json"
   LLM_CONTAINER="/config/scripts/av-auto-fs/llm_runtime.${run_id}.json"
-  trap cleanup_llm EXIT
+  trap cleanup_on_exit EXIT
+elif [ "$HAS_URL" = 1 ]; then
+  trap cleanup_on_exit EXIT
 fi
 
 if ! load_share_floor_probe; then
@@ -185,7 +300,7 @@ fi
 
 if [ "$rc" -eq 0 ]; then
   set +e
-  ssh -o BatchMode=yes root@192.168.1.9 docker exec "${docker_env[@]}" moviepilot python3 /config/scripts/av_auto.py "$@"
+  run_python_remote "$@"
   rc=$?
   set -e
 fi

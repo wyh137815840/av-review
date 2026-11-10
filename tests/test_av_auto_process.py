@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -535,6 +536,309 @@ class ShellEntryTests(unittest.TestCase):
         )
         logged = log.read_text(encoding="utf-8") if log.exists() else ""
         return result.returncode, result.stderr, logged
+
+
+class DurableFramesTests(unittest.TestCase):
+    """Frames and review.json must survive outside container /tmp.
+
+    The 2026-11-11 ABP-073/108/246/313/383 run reported 完成 while the
+    artifacts existed only under /tmp/av-auto-frames.
+    """
+
+    def _layout(self, code: str, *, inbox: bool, keepers: int) -> dict:
+        return {
+            "inbox": inbox,
+            "dest": keepers > 0,
+            "dest_keepers": keepers,
+            "inbox_path": f"/av-auto/_staging/{code}",
+            "dest_path": f"/av-auto/{code}",
+        }
+
+    def _seed(self, folder: Path, code: str, review: dict, grok: dict | None = None) -> None:
+        folder.mkdir(parents=True, exist_ok=True)
+        name = f"{code}_frame_120s.jpg"
+        (folder / name).write_bytes(b"\xff\xd8" + b"\x00" * 800)
+        manifest = {
+            "code": code,
+            "precheck": True,
+            "shots": [{"label": "frame_120s", "ss": 120, "ok": True, "valid": True, "file": name}],
+        }
+        (folder / "frames_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        (folder / "review.json").write_text(json.dumps(review), encoding="utf-8")
+        if grok is not None:
+            (folder / "grok_review.json").write_text(json.dumps(grok), encoding="utf-8")
+
+    def _envs(self, official: Path, scratch: Path):
+        return mock.patch.dict(
+            os.environ,
+            {"AV_AUTO_FRAMES_ROOT": str(official), "AV_AUTO_FRAMES_TMP": str(scratch)},
+            clear=False,
+        )
+
+    def test_candidate_order_prefers_the_official_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            official = root / "official"
+            scratch = root / "scratch"
+            with self._envs(official, scratch):
+                dirs = av_auto._candidate_frames_dirs("ABP-073")
+        self.assertEqual(dirs[0], official / "ABP-073")
+        self.assertEqual(dirs[1], scratch / "ABP-073")
+
+    def test_process_writes_five_titles_to_the_official_frames_dir(self):
+        calls: list = []
+
+        def review_of(code):
+            if code == "ABP-313":
+                return ("pass", "fail", "disagree", "uncertain")
+            return ("pass", "pass", "agree", "pass")
+
+        def fake_clean(args):
+            calls.append(("clean", args.code))
+            return 0
+
+        def fake_strm(args):
+            calls.append(("strm", tuple(args.codes)))
+            return 0
+
+        def fake_frames(args):
+            calls.append(("frames", args.code, str(args.out)))
+            folder = Path(args.out)
+            folder.mkdir(parents=True, exist_ok=True)
+            name = f"{args.code}_frame_120s.jpg"
+            (folder / name).write_bytes(b"\xff\xd8" + b"\x00" * 900)
+            manifest = {
+                "code": args.code,
+                "precheck": True,
+                "shots": [{"label": "frame_120s", "ss": 120, "ok": True, "valid": True, "file": name}],
+            }
+            (folder / "frames_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            return 0
+
+        def fake_review(args):
+            calls.append(("review", args.code, str(args.out)))
+            pair = review_of(args.code)
+            (Path(args.out) / "review.json").write_text(
+                json.dumps(_review(args.code, pair[0], pair[1], pair[2], pair[3])),
+                encoding="utf-8",
+            )
+            return 0
+
+        def fake_grok(args):
+            calls.append(("grok", args.code, str(args.frames_dir)))
+            (Path(args.frames_dir) / "grok_review.json").write_text(
+                json.dumps({"code": args.code, "trigger": "disagree", "verdict": "fail", "role": "tiebreak"}),
+                encoding="utf-8",
+            )
+            return 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            official = root / "official"
+            scratch = root / "scratch"
+            with self._envs(official, scratch), \
+                 mock.patch.object(av_auto, "_offline_layout", side_effect=lambda code: self._layout(code, inbox=True, keepers=0)), \
+                 mock.patch.object(av_auto, "_staging_strm_ready", return_value=False), \
+                 mock.patch.object(av_auto, "cmd_clean", side_effect=fake_clean), \
+                 mock.patch.object(av_auto, "cmd_strm", side_effect=fake_strm), \
+                 mock.patch.object(av_auto, "cmd_frames", side_effect=fake_frames), \
+                 mock.patch.object(av_auto, "cmd_review", side_effect=fake_review), \
+                 mock.patch.object(av_auto, "cmd_grok_review", side_effect=fake_grok), \
+                 mock.patch.object(av_auto, "cmd_submit", side_effect=AssertionError("submit")), \
+                 mock.patch.object(av_auto, "cmd_promote", side_effect=AssertionError("promote")):
+                rc, out, err = _run_main(["process", *FIVE])
+                self.assertEqual(rc, 0, err)
+                self.assertEqual(err, "")
+                self.assertIn("PROCESS 全部完成: " + " ".join(FIVE), out)
+                for code in FIVE:
+                    folder = official / code
+                    self.assertTrue(av_auto._frames_ready(folder), code)
+                    self.assertIsNotNone(av_auto._complete_review(folder), code)
+                    self.assertTrue((folder / f"{code}_frame_120s.jpg").stat().st_size > 500)
+                    done = out.index(f"PROCESS {code}: 完成")
+                    self.assertLess(out.rindex(f"persist {code}:", 0, done), done)
+                    self.assertIn(str(folder), out)
+                    frame_calls = [item for item in calls if item[0] == "frames" and item[1] == code]
+                    self.assertEqual(frame_calls[0][2], str(folder))
+                    self.assertFalse((scratch / code).exists(), code)
+                review_313 = (official / "ABP-313" / "review.json").read_bytes()
+                grok_313 = (official / "ABP-313" / "grok_review.json").read_bytes()
+                self.assertNotEqual(review_313, grok_313)
+                self.assertNotIn(b"cursor/grok-4.7", review_313)
+                self.assertEqual(json.loads(grok_313)["trigger"], "disagree")
+                for code in ("ABP-073", "ABP-108", "ABP-246", "ABP-383"):
+                    self.assertFalse((official / code / "grok_review.json").exists(), code)
+
+                calls.clear()
+                planted = scratch / "ABP-073"
+                self._seed(planted, "ABP-073", _review("ABP-073", "fail", "fail", "agree", "fail"))
+                kept = (official / "ABP-073" / "review.json").read_bytes()
+                with mock.patch.object(av_auto, "_offline_layout", side_effect=lambda code: self._layout(code, inbox=False, keepers=1)), \
+                     mock.patch.object(av_auto, "_staging_strm_ready", return_value=True):
+                    rc, out, err = _run_main(["process", "ABP-073"])
+                    self.assertEqual(rc, 0, err)
+                    self.assertEqual([item[0] for item in calls], [])
+                    self.assertEqual((official / "ABP-073" / "review.json").read_bytes(), kept)
+                    self.assertIn("SKIP frames ABP-073", out)
+                    shutil.rmtree(scratch)
+                    calls.clear()
+                    rc, out, err = _run_main(["process", *FIVE])
+                self.assertEqual(rc, 0, err)
+                self.assertEqual([item[0] for item in calls], [])
+                self.assertEqual((official / "ABP-073" / "review.json").read_bytes(), kept)
+                self.assertTrue((official / "ABP-313" / "grok_review.json").is_file())
+
+    def test_tmp_only_artifacts_are_copied_before_success(self):
+        calls: list = []
+
+        def boom(*_args, **_kwargs):
+            raise AssertionError("tmp leftovers must be reused, not extracted again")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            official = root / "official"
+            scratch = root / "scratch"
+            for code in FIVE:
+                review = _review(code, "fail", "fail", "agree", "fail")
+                grok = None
+                if code == "ABP-246":
+                    review = _review(code, "uncertain", "uncertain", "agree", "uncertain")
+                    grok = {"code": code, "trigger": "uncertain", "verdict": "pass"}
+                self._seed(scratch / code, code, review, grok)
+            expected = {
+                code: (scratch / code / "review.json").read_bytes()
+                for code in FIVE
+            }
+            with self._envs(official, scratch), \
+                 mock.patch.object(av_auto, "_offline_layout", side_effect=lambda code: self._layout(code, inbox=False, keepers=1)), \
+                 mock.patch.object(av_auto, "_staging_strm_ready", return_value=True), \
+                 mock.patch.object(av_auto, "cmd_frames", side_effect=boom), \
+                 mock.patch.object(av_auto, "cmd_review", side_effect=boom), \
+                 mock.patch.object(av_auto, "cmd_grok_review", side_effect=boom), \
+                 mock.patch.object(av_auto, "cmd_clean", side_effect=lambda args: calls.append(args.code) or 0), \
+                 mock.patch.object(av_auto, "cmd_strm", side_effect=boom):
+                rc, out, err = _run_main(["process", *FIVE])
+            self.assertEqual(rc, 0, err)
+            self.assertNotIn("PROCESS 未完成", err)
+            for code in FIVE:
+                folder = official / code
+                self.assertEqual((folder / "review.json").read_bytes(), expected[code])
+                self.assertTrue(av_auto._frames_ready(folder), code)
+                done = out.index(f"PROCESS {code}: 完成")
+                self.assertLess(out.rindex(f"persist {code}:", 0, done), done)
+            self.assertEqual(
+                json.loads((official / "ABP-246" / "grok_review.json").read_text(encoding="utf-8"))["verdict"],
+                "pass",
+            )
+            self.assertNotEqual(
+                (official / "ABP-246" / "review.json").read_bytes(),
+                (official / "ABP-246" / "grok_review.json").read_bytes(),
+            )
+
+    def test_persist_failure_is_not_reported_as_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            blocker = root / "official-blocked"
+            blocker.write_text("not a directory", encoding="utf-8")
+            scratch = root / "scratch"
+            self._seed(scratch / "ABP-073", "ABP-073", _review("ABP-073", "pass", "pass", "agree", "pass"))
+            with self._envs(blocker, scratch), \
+                 mock.patch.object(av_auto, "_offline_layout", side_effect=lambda code: self._layout(code, inbox=False, keepers=1)), \
+                 mock.patch.object(av_auto, "_staging_strm_ready", return_value=True), \
+                 mock.patch.object(av_auto, "cmd_frames", side_effect=AssertionError("frames")), \
+                 mock.patch.object(av_auto, "cmd_review", side_effect=AssertionError("review")), \
+                 mock.patch.object(av_auto, "cmd_submit", side_effect=AssertionError("submit")), \
+                 mock.patch.object(av_auto, "cmd_promote", side_effect=AssertionError("promote")):
+                rc, out, err = _run_main(["process", "ABP-073", "ABP-108"])
+            self.assertEqual(rc, 1)
+            self.assertIn("FAIL ABP-073", err)
+            self.assertIn("持久目录", err)
+            self.assertNotIn("PROCESS ABP-073: 完成", out)
+            self.assertNotIn("PROCESS 全部完成", out)
+            self.assertTrue((scratch / "ABP-073" / "review.json").is_file())
+
+    def test_frames_and_review_entries_persist_before_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            official = root / "official"
+            scratch = root / "scratch"
+            strm = root / "ABP-388.strm"
+            strm.write_text("http://example.test/play\n", encoding="utf-8")
+
+            def fake_ff(args, timeout):
+                self.assertIn("ffprobe", args)
+                return subprocess.CompletedProcess(args, 0, stdout='{"format":{"duration":"200"}}', stderr="")
+
+            def fake_extract(media, dest, ss, session=None):
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(b"\xff\xd8" + b"\x00" * 800)
+                return {"ss": ss, "ok": True, "degraded": False, "bytes": dest.stat().st_size, "error": ""}
+
+            def fake_precheck(*_args, **_kwargs):
+                return {"valid": True, "reason": "ok", "confidence": "mid", "uncertain": False}
+
+            runtime = {
+                "url": "http://127.0.0.1:9",
+                "key": "not-a-real-key",
+                "precheck_model": av_auto.PRECHECK_MODEL,
+                "review_models": list(av_auto.REVIEW_MODELS),
+            }
+            with self._envs(official, scratch), \
+                 mock.patch.object(av_auto, "_paths", return_value={"staging_strm": root, "official_strm": root}), \
+                 mock.patch.object(av_auto, "_resolve_cdn", side_effect=RuntimeError("offline")), \
+                 mock.patch.object(av_auto, "open_fmp4_session", return_value=None), \
+                 mock.patch.object(av_auto, "_run_ff", side_effect=fake_ff), \
+                 mock.patch.object(av_auto, "_extract_one", side_effect=fake_extract), \
+                 mock.patch.object(av_auto, "_load_llm_runtime", return_value=runtime), \
+                 mock.patch.object(av_auto, "_precheck_image", side_effect=fake_precheck):
+                rc, out, err = _run_main(["frames", "ABP-388", "--strm", str(strm)])
+            self.assertEqual(rc, 0, err)
+            folder = official / "ABP-388"
+            self.assertTrue(av_auto._frames_ready(folder), err)
+            self.assertLess(out.index("persist ABP-388:"), out.index("frames 抽出"))
+            self.assertFalse((scratch / "ABP-388").exists())
+
+            work = scratch / "ABP-388"
+            self._seed(work, "ABP-388", _review("ABP-388", "pass", "pass", "agree", "pass"))
+            (work / "review.json").unlink()
+            chats: list = []
+
+            def fake_chat(*_args, **_kwargs):
+                chats.append(1)
+                return {
+                    "ok": True,
+                    "parsed": {"verdict": "pass", "hits": [], "reason": "ok", "confidence": "mid"},
+                    "usage": {},
+                    "elapsed_s": 0,
+                    "http": 200,
+                    "attempts": 1,
+                }
+
+            with self._envs(official, scratch), \
+                 mock.patch.object(av_auto, "_load_llm_runtime", return_value=runtime), \
+                 mock.patch.object(av_auto, "_chat_retry", side_effect=fake_chat):
+                rc, out, err = _run_main(["review", "ABP-388", "--out", str(work), "--cleanup"])
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(len(chats), 2)
+            official_review = official / "ABP-388" / "review.json"
+            self.assertIsNotNone(av_auto._complete_review(official / "ABP-388"))
+            self.assertLess(out.index("persist ABP-388:"), out.index("agree/pass"))
+            self.assertIn(str(official_review), out)
+            self.assertTrue((official / "ABP-388" / "ABP-388_frame_120s.jpg").is_file())
+            self.assertFalse((work / "ABP-388_frame_120s.jpg").exists())
+            self.assertTrue((work / "review.json").is_file())
+
+            blocker = root / "blocked"
+            blocker.write_text("nope", encoding="utf-8")
+            self._seed(work, "ABP-108", _review("ABP-108", "pass", "pass", "agree", "pass"))
+            (work / "review.json").unlink()
+            with self._envs(blocker, scratch), \
+                 mock.patch.object(av_auto, "_load_llm_runtime", return_value=runtime), \
+                 mock.patch.object(av_auto, "_chat_retry", side_effect=fake_chat):
+                rc, out, err = _run_main(["review", "ABP-108", "--out", str(work)])
+            self.assertEqual(rc, 1)
+            self.assertNotIn("agree/pass", out)
+            self.assertIn("持久目录", err)
 
 
 if __name__ == "__main__":

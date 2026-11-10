@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import errno
 import io
+import json
 import os
 import re
 import subprocess
@@ -553,6 +554,171 @@ class OfficialEntryTests(unittest.TestCase):
         self.assertIn("AV_AUTO_LLM_FILE", text)
         syntax = subprocess.run(["bash", "-n", str(ROOT / "bin" / "av_auto")], capture_output=True, text=True)
         self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+
+class Ed2kUrlForwardTests(unittest.TestCase):
+    """ssh must not let the remote shell split an ed2k URI on '|'."""
+
+    URI = "ed2k://|file|ABP-388 it's $(id) $HOME.mp4|42|0123456789abcdef0123456789abcdef|/"
+    MAGNET = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=ABP-950 name"
+
+    def _run(self, tmp: Path, args: list[str], extra: dict | None = None):
+        fake = tmp / "bin"
+        fake.mkdir()
+        docker_argv = tmp / "docker-argv.jsonl"
+        script_path = tmp / "remote.sh"
+        url_mode = tmp / "url-mode.txt"
+        ssh_log = tmp / "ssh.log"
+        apply_log = tmp / "apply.log"
+        local_tmp = tmp / "localtmp"
+        local_tmp.mkdir()
+        (fake / "docker").write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "path = Path(os.environ['DOCKER_ARGV_OUT'])\n"
+            "with path.open('a', encoding='utf-8') as handle:\n"
+            "    handle.write(json.dumps(sys.argv[1:], ensure_ascii=False) + '\\n')\n"
+            "raise SystemExit(int(os.environ.get('DOCKER_RC', '0')))\n",
+            encoding="utf-8",
+        )
+        (fake / "docker").chmod(0o755)
+        (fake / "ssh").write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, re, subprocess, sys\n"
+            "from pathlib import Path\n"
+            "argv_s = ' '.join(sys.argv[1:])\n"
+            "stdin = sys.stdin.buffer.read()\n"
+            "log = Path(os.environ['SSH_LOG'])\n"
+            "with log.open('a', encoding='utf-8') as handle:\n"
+            "    handle.write(argv_s + '\\n')\n"
+            "if 'bash -s' in argv_s:\n"
+            "    script = stdin.decode('utf-8', 'replace')\n"
+            "    Path(os.environ['SCRIPT_PATH']).write_text(script, encoding='utf-8')\n"
+            "    if 'url_file=' not in script:\n"
+            "        raise SystemExit(0)\n"
+            "    proc = subprocess.run(['bash', '-s'], input=script.encode(), env=os.environ.copy())\n"
+            "    raise SystemExit(proc.returncode)\n"
+            "if 'av-auto-url' in argv_s and 'cat >' in argv_s:\n"
+            "    remote = sys.argv[-1]\n"
+            "    proc = subprocess.run(['bash', '-c', remote], input=stdin)\n"
+            "    match = re.search(r'cat > (\\S+)', remote)\n"
+            "    if proc.returncode == 0 and match:\n"
+            "        path = Path(match.group(1))\n"
+            "        Path(os.environ['URL_MODE']).write_text(oct(path.stat().st_mode & 0o777), encoding='utf-8')\n"
+            "    raise SystemExit(proc.returncode)\n"
+            "if 'av_auto_apply_fs' in argv_s:\n"
+            "    path = Path(os.environ['APPLY_LOG'])\n"
+            "    path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "    with path.open('a', encoding='utf-8') as handle:\n"
+            "        handle.write('apply\\n')\n"
+            "    raise SystemExit(int(os.environ.get('APPLY_RC', '0')))\n"
+            "if 'rm -f' in argv_s and 'av-auto-url' in argv_s:\n"
+            "    match = re.search(r'rm -f -- (\\S+)', argv_s)\n"
+            "    if match:\n"
+            "        Path(match.group(1)).unlink(missing_ok=True)\n"
+            "    raise SystemExit(0)\n"
+            "raise SystemExit(0)\n",
+            encoding="utf-8",
+        )
+        (fake / "ssh").chmod(0o755)
+        env = os.environ.copy()
+        env["PATH"] = str(fake) + os.pathsep + env.get("PATH", "")
+        env["TMPDIR"] = str(local_tmp)
+        env["SSH_LOG"] = str(ssh_log)
+        env["SCRIPT_PATH"] = str(script_path)
+        env["URL_MODE"] = str(url_mode)
+        env["APPLY_LOG"] = str(apply_log)
+        env["DOCKER_ARGV_OUT"] = str(docker_argv)
+        env.update(extra or {})
+        result = subprocess.run(
+            ["bash", str(ROOT / "bin" / "av_auto"), *args],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=20,
+        )
+        logged = ssh_log.read_text(encoding="utf-8") if ssh_log.exists() else ""
+        script = script_path.read_text(encoding="utf-8") if script_path.exists() else ""
+        mode = url_mode.read_text(encoding="utf-8") if url_mode.exists() else ""
+        argv_lines = []
+        if docker_argv.exists():
+            argv_lines = [json.loads(line) for line in docker_argv.read_text(encoding="utf-8").splitlines() if line]
+        apply_text = apply_log.read_text(encoding="utf-8") if apply_log.exists() else ""
+        return result, logged, script, mode, argv_lines, apply_text, local_tmp
+
+    def _assert_hidden(self, secret: str, result, logged: str, script: str, local_tmp: Path):
+        blob = result.stdout + result.stderr + logged + script
+        self.assertNotIn(secret, blob)
+        self.assertNotIn("|file|", logged)
+        for path in local_tmp.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(secret, path.read_text(encoding="utf-8", errors="ignore"))
+
+    def test_unquoted_ed2k_is_split_by_the_shell(self):
+        plain = "ed2k://|file|ABP-388.mp4|42|0123456789abcdef0123456789abcdef|/"
+        script = "true --url " + plain
+        with tempfile.TemporaryDirectory() as tmp:
+            broken = subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True,
+                text=True,
+                cwd=tmp,
+                timeout=10,
+            )
+        self.assertNotEqual(broken.returncode, 0)
+        self.assertIn("Is a directory", broken.stderr)
+
+    def test_submit_and_intake_pass_ed2k_as_one_argv(self):
+        cases = [
+            (["submit", "--code", "ABP-388", "--url", self.URI], "submit", self.URI),
+            (["submit", "--code", "ABP-733", f"--url={self.URI}"], "submit", self.URI),
+            (["intake", "--code", "ABP-960", "--url", self.MAGNET], "intake", self.MAGNET),
+        ]
+        for args, command, secret in cases:
+            with self.subTest(command=command):
+                with tempfile.TemporaryDirectory() as tmp:
+                    result, logged, script, mode, argv_lines, apply_text, local_tmp = self._run(Path(tmp), args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(apply_text.count("apply\n"), 1)
+                self.assertEqual(mode, "0o600")
+                self.assertIn('--url "$URI"', script)
+                self.assertEqual(len(argv_lines), 1)
+                argv = argv_lines[0]
+                self.assertEqual(argv[:6], ["exec", "-e", "PYTHONUNBUFFERED=1", "moviepilot", "python3", "/config/scripts/av_auto.py"])
+                self.assertEqual(argv[6], command)
+                self.assertEqual(argv[-2:], ["--url", secret])
+                self._assert_hidden(secret, result, logged, script, local_tmp)
+                match = re.search(r"^url_file=(\S+)", script, re.M)
+                self.assertIsNotNone(match)
+                self.assertFalse(Path(match.group(1)).exists())
+
+    def test_docker_failure_still_applies_and_does_not_print_the_url(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, logged, script, _mode, argv_lines, apply_text, local_tmp = self._run(
+                Path(tmp),
+                ["submit", "--code", "ABP-838", "--url", self.URI],
+                {"DOCKER_RC": "126"},
+            )
+        self.assertEqual(result.returncode, 126, result.stderr)
+        self.assertEqual(apply_text.count("apply\n"), 1)
+        self.assertEqual(argv_lines[-1][-1], self.URI)
+        self._assert_hidden(self.URI, result, logged, script, local_tmp)
+
+    def test_two_urls_stop_before_ssh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, logged, script, _mode, argv_lines, apply_text, _local = self._run(
+                Path(tmp),
+                ["submit", "--code", "ABP-950", "--url", self.URI, "--url", self.MAGNET],
+            )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("只接受一个 --url", result.stderr)
+        self.assertNotIn(self.URI, result.stdout + result.stderr)
+        self.assertNotIn(self.MAGNET, result.stdout + result.stderr)
+        self.assertEqual(logged, "")
+        self.assertEqual(script, "")
+        self.assertEqual(argv_lines, [])
+        self.assertEqual(apply_text, "")
 
 
 if __name__ == "__main__":

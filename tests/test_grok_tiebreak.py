@@ -210,6 +210,20 @@ class DefaultBanTests(unittest.TestCase):
 
 
 class CommandTests(unittest.TestCase):
+    def setUp(self):
+        self._official = tempfile.TemporaryDirectory()
+        self.official_root = Path(self._official.name) / "frames"
+        self._env = mock.patch.dict(
+            os.environ,
+            {"AV_AUTO_FRAMES_ROOT": str(self.official_root)},
+            clear=False,
+        )
+        self._env.start()
+
+    def tearDown(self):
+        self._env.stop()
+        self._official.cleanup()
+
     def _layout(self, root: Path, ds: str, lu: str, agreement: str, consensus: str, *, precheck: bool = True) -> bytes:
         good = "ABP-123_frame_120s.jpg"
         _jpeg(root / good)
@@ -298,6 +312,15 @@ class CommandTests(unittest.TestCase):
             text = buf.getvalue()
             self.assertIn("tiebreak KEPT fail", text)
             self.assertIn("保留 fail", text)
+            self.assertLess(text.index("persist ABP-123:"), text.index("tiebreak KEPT"))
+            official = self.official_root / "ABP-123"
+            self.assertEqual((official / "review.json").read_bytes(), before)
+            self.assertEqual(
+                (official / "grok_review.json").read_bytes(),
+                (root / "grok_review.json").read_bytes(),
+            )
+            self.assertNotEqual((official / "review.json").read_bytes(), (official / "grok_review.json").read_bytes())
+            self.assertFalse((official / "media_llm_route.json").exists())
             doc = json.loads((root / "grok_review.json").read_text(encoding="utf-8"))
             self.assertEqual(doc["verdict"], "fail")
             self.assertEqual(doc["confidence"], "high")

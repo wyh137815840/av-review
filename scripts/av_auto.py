@@ -12,6 +12,9 @@ Promote is explicit and never automatic.
 After offline is already finished, `process` is the only end-to-end entry:
 clean → strm → frames → dual-model review → grok-review when uncertain or split.
 It does not submit, scrape, or promote. A catalog code is never a subcommand.
+Completed frames, review.json, and any grok_review.json are written to
+/config/scripts/av-auto-fs/frames/<code>/ before the run reports success.
+A container /tmp/av-auto-frames copy alone is not success.
 
 Default final review stays DeepSeek-flash + gpt-6-luna. `grok-review` is a
 separate Magpie tiebreaker for uncertain or split results: it pins
@@ -64,6 +67,10 @@ SEEK_TAIL_GUARD = 90      # avoid end credits
 SEEK_DEDUP = 30
 PRECHECK_RETRIES = 3      # plus the first attempt
 LLM_RUNTIME = Path("/config/scripts/av-auto-fs/llm_runtime.json")
+# Host bind: /mnt/user/appdata/moviepilot/config/scripts/av-auto-fs/frames/
+OFFICIAL_FRAMES_ROOT = Path("/config/scripts/av-auto-fs/frames")
+TMP_FRAMES_ROOT = Path("/tmp/av-auto-frames")
+_PERSIST_JSON = {"frames_manifest.json", "review.json", "grok_review.json", "probe.json"}
 MAGPIE_DEFAULT = "http://192.168.1.9:3430"
 PRECHECK_MODEL = "deepseek/deepseek-flash"
 REVIEW_MODELS = ("deepseek/deepseek-flash", "chatgpt-api/gpt-6-luna")
@@ -1395,9 +1402,19 @@ def cmd_frames(args) -> int:
         _die("用法: av_auto frames 番号  或  av_auto frames --strm /path/file.strm")
     if not strm.is_file():
         _die(f"strm 不存在: {strm}")
-    code = code or strm.stem
-    out = Path(args.out) if args.out else Path(f"/tmp/av-auto-frames/{code}")
-    out.mkdir(parents=True, exist_ok=True)
+    code = code or _norm_code(strm.stem) or strm.stem
+    explicit = str(getattr(args, "out", "") or "").strip()
+    if explicit:
+        out = Path(explicit)
+    else:
+        out, rc = _select_frames_dir(code)
+        if rc != 0:
+            return rc
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"FAIL {code}: 未能创建帧目录 {out}（{exc.strerror or exc}）", file=sys.stderr)
+        return 1
     precheck = not bool(getattr(args, "no_precheck", False))
     reuse = not bool(getattr(args, "no_reuse", False))
     llm = _load_llm_runtime() if precheck else None
@@ -1606,23 +1623,36 @@ def cmd_frames(args) -> int:
             "finished_at": datetime.now(TZ).isoformat(),
         }
         (out / "frames_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")
-        print(
+        produced = valid_n if precheck else ok
+        summary = (
             f"frames 抽出 {ok}/{len(pts)} 有效 {valid_n}/{len(pts)} → {out}"
             + (f"  丢弃 {len(discarded)}" if discarded else "")
             + (f"  预检 DeepSeek ¥{cost['deepseek_cny']:.4f}" if precheck else "")
         )
-        keep = Path(f"/tmp/av-auto-frames/{code}_manifest.json")
-        keep.parent.mkdir(parents=True, exist_ok=True)
-        keep.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")
+        try:
+            keep = _tmp_frames_root() / f"{code}_manifest.json"
+            keep.parent.mkdir(parents=True, exist_ok=True)
+            keep.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")
+        except OSError as exc:
+            print(f"NOTE: 临时清单未写到容器 tmp（{exc.strerror or exc}）", file=sys.stderr)
+        if not produced:
+            print(summary)
+            return 1
+        if _persist_frames_dir(code, out) != 0:
+            return 1
+        print(summary)
         if args.cleanup:
-            for child in out.iterdir():
-                if child.name != "frames_manifest.json":
-                    if child.is_file():
-                        child.unlink()
-                    elif child.is_dir():
-                        shutil.rmtree(child, ignore_errors=True)
-            print("已清理临时帧（保留 frames_manifest.json）")
-        return 0 if (valid_n if precheck else ok) else 1
+            if _same_frames_path(out, _durable_frames_dir(code)):
+                print(f"保留持久帧 {out}")
+            else:
+                for child in out.iterdir():
+                    if child.name != "frames_manifest.json":
+                        if child.is_file():
+                            child.unlink()
+                        elif child.is_dir():
+                            shutil.rmtree(child, ignore_errors=True)
+                print("已清理临时帧（保留 frames_manifest.json）")
+        return 0
     finally:
         if session is not None:
             fetched = int(session.remote.fetched)
@@ -1640,14 +1670,14 @@ def _load_manifest(out: Path, code: str) -> dict:
 
 def cmd_review(args) -> int:
     """Dual-model final review on valid frames only. Never sends invalid shots."""
-    paths = _paths()
     code = _norm_code(args.code)
-    out = Path(args.out) if args.out else Path(f"/tmp/av-auto-frames/{code}")
-    if not args.out:
-        # prefer the same dir used by frames in this environment
-        alt = Path(f"/config/scripts/av-auto-fs/frames/{code}")
-        if not (out / "frames_manifest.json").is_file() and (alt / "frames_manifest.json").is_file():
-            out = alt
+    explicit = str(getattr(args, "out", "") or "").strip()
+    if explicit:
+        out = Path(explicit)
+    else:
+        out, rc = _resolve_marker_dir(code, "frames_manifest.json")
+        if rc != 0:
+            return rc
     manifest = _load_manifest(out, code)
     if not manifest.get("precheck"):
         _die("清单未经有效性预检。请先跑 av_auto frames（默认会预检），不要把未预检帧送进终审。")
@@ -1711,14 +1741,23 @@ def cmd_review(args) -> int:
     }
     dest = out / "review.json"
     dest.write_text(json.dumps(result, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")
-    print(f"review {code}: {agreement}/{consensus}  DeepSeek ¥{cost['deepseek_cny']:.4f}  luna 约 ${cost['luna_usd_est']:.4f} → {dest}")
+    if _persist_frames_dir(code, out, require_review=True) != 0:
+        return 1
+    official_review = _durable_frames_dir(code) / "review.json"
+    print(
+        f"review {code}: {agreement}/{consensus}  DeepSeek ¥{cost['deepseek_cny']:.4f}"
+        f"  luna 约 ${cost['luna_usd_est']:.4f} → {official_review}"
+    )
     if args.cleanup:
-        for child in out.iterdir():
-            if child.name in {"frames_manifest.json", "review.json"}:
-                continue
-            if child.is_file() and child.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
-                child.unlink()
-        print("已清理临时帧（保留 frames_manifest.json 与 review.json）")
+        if _same_frames_path(out, _durable_frames_dir(code)):
+            print(f"保留持久帧 {out}")
+        else:
+            for child in out.iterdir():
+                if child.name in {"frames_manifest.json", "review.json"}:
+                    continue
+                if child.is_file() and child.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
+                    child.unlink()
+            print("已清理临时帧（保留 frames_manifest.json 与 review.json）")
     return 0
 
 
@@ -1998,18 +2037,15 @@ def _grok_tiebreak_chat(cfg: dict, images: list[Path], user_text: str, tries: in
     return last
 
 
-def _grok_frames_dir(args) -> tuple[str, Path]:
+def _grok_frames_dir(args) -> tuple[str, Path, int]:
     code = _norm_code(getattr(args, "code", "") or "")
     raw = str(getattr(args, "frames_dir", "") or getattr(args, "out", "") or "").strip()
     if raw:
-        return code, Path(raw)
+        return code, Path(raw), 0
     if not code:
         _die("请指定番号，或用 --frames-dir 指向已有 review.json 的帧目录")
-    out = Path(f"/tmp/av-auto-frames/{code}")
-    alt = Path(f"/config/scripts/av-auto-fs/frames/{code}")
-    if not (out / "review.json").is_file() and (alt / "review.json").is_file():
-        out = alt
-    return code, out
+    out, rc = _resolve_marker_dir(code, "review.json")
+    return code, out, rc
 
 
 def _write_grok_review(frames_dir: Path, doc: dict, secret: str) -> Path:
@@ -2034,7 +2070,9 @@ def cmd_grok_review(args) -> int:
     Does not rerun DeepSeek or gpt-6-luna, does not change media_llm_route.json,
     does not overwrite review.json, and does not promote.
     """
-    code, out = _grok_frames_dir(args)
+    code, out, dir_rc = _grok_frames_dir(args)
+    if dir_rc != 0:
+        return dir_rc
     review_path = out / "review.json"
     if not review_path.is_file():
         _die(f"找不到 {review_path}。请先跑 av_auto review；Grok 不重跑 DeepSeek / gpt-6-luna。")
@@ -2048,6 +2086,8 @@ def cmd_grok_review(args) -> int:
         _die("review.json 里没有番号")
     trigger = tiebreak_trigger(review)
     if not trigger:
+        if _persist_frames_dir(code, out) != 0:
+            return 1
         agreement = review.get("agreement") or ""
         consensus = review.get("consensus") or ""
         stale = ""
@@ -2093,13 +2133,18 @@ def cmd_grok_review(args) -> int:
     )
     if review_path.read_bytes() != before:
         _die("review.json 被改动，已中止，不写 grok_review.json")
-    dest = _write_grok_review(out, doc, str(llm.get("key") or ""))
+    written = _write_grok_review(out, doc, str(llm.get("key") or ""))
     if review_path.read_bytes() != before:
         _die("review.json 被改动")
+    if _persist_frames_dir(code, out) != 0:
+        return 1
+    if review_path.read_bytes() != before:
+        _die("review.json 被改动")
+    official_grok = _durable_frames_dir(code) / written.name
     tag = "KEPT" if doc["tiebreak"]["resolved"] else "UNRESOLVED"
     print(f"  {GROK_TIEBREAK_MODEL}: {grok['verdict']} {grok['confidence']} {grok['reason']}".rstrip())
     print(f"tiebreak {tag} {doc['tiebreak']['kept_verdict']}  {doc['tiebreak']['conclusion']}")
-    print(f"→ {dest}")
+    print(f"→ {official_grok}")
     return 0
 
 
@@ -2462,15 +2507,187 @@ def cmd_intake(args) -> int:
         ))
         if rc == 0 and getattr(args, "review", False):
             rc = cmd_review(argparse.Namespace(code=args.code, out=out, cleanup=cleanup))
-    print(f"INTAKE { _norm_code(args.code) }: 完成（未 promote，未刮削）")
+    if rc == 0:
+        print(f"INTAKE { _norm_code(args.code) }: 完成（未 promote，未刮削）")
     return rc
 
 
+def _frames_root_from_env(name: str, default: Path) -> Path:
+    raw = (os.environ.get(name) or "").strip()
+    return Path(raw) if raw else default
+
+
+def _official_frames_root() -> Path:
+    return _frames_root_from_env("AV_AUTO_FRAMES_ROOT", OFFICIAL_FRAMES_ROOT)
+
+
+def _tmp_frames_root() -> Path:
+    return _frames_root_from_env("AV_AUTO_FRAMES_TMP", TMP_FRAMES_ROOT)
+
+
+def _official_frames_dir(code: str) -> Path:
+    return _official_frames_root() / code
+
+
+def _tmp_frames_dir(code: str) -> Path:
+    return _tmp_frames_root() / code
+
+
 def _candidate_frames_dirs(code: str) -> list[Path]:
-    return [
-        Path(f"/tmp/av-auto-frames/{code}"),
-        Path(f"/config/scripts/av-auto-fs/frames/{code}"),
-    ]
+    """Durable directory first, then container tmp.
+
+    Later runs must reuse official artifacts. A /tmp-only tree is not enough.
+    """
+    return [_official_frames_dir(code), _tmp_frames_dir(code)]
+
+
+def _durable_frames_dir(code: str) -> Path:
+    dirs = _candidate_frames_dirs(code)
+    if not dirs:
+        return _official_frames_dir(code)
+    return dirs[0]
+
+
+def _same_frames_path(a: Path, b: Path) -> bool:
+    try:
+        if a.exists() or b.exists():
+            return a.resolve() == b.resolve()
+    except OSError:
+        pass
+    return os.path.normcase(os.path.normpath(str(a))) == os.path.normcase(os.path.normpath(str(b)))
+
+
+def _is_frames_artifact(name: str) -> bool:
+    if not name or name.endswith(".tmp") or name.endswith(".persist-tmp"):
+        return False
+    if name in _PERSIST_JSON:
+        return True
+    return Path(name).suffix.lower() in _FRAME_EXT
+
+
+def _copy_frames_file(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.parent / f".{dst.name}.persist-tmp"
+    try:
+        tmp.write_bytes(src.read_bytes())
+        os.chmod(tmp, 0o644)
+        tmp.replace(dst)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def _copy_frames_tree(src: Path, dst: Path) -> None:
+    """Copy frame artifacts onto dst. Never rename grok output onto review.json."""
+    if _same_frames_path(src, dst):
+        return
+    if not src.is_dir():
+        raise OSError(errno.ENOENT, "frames directory missing", str(src))
+    dst.mkdir(parents=True, exist_ok=True)
+    for child in src.iterdir():
+        if not child.is_file() or not _is_frames_artifact(child.name):
+            continue
+        if child.name != "review.json" and (dst / child.name).name == "review.json":
+            raise OSError(errno.EPERM, "refusing to overwrite review.json")
+        _copy_frames_file(child, dst / child.name)
+
+
+def _persist_error(code: str, official: Path, exc: OSError) -> int:
+    err = getattr(exc, "strerror", None) or str(exc)
+    print(
+        f"FAIL {code}: 未能把帧写入持久目录 {official}（{err}）。"
+        "只写在容器 /tmp 不算完成。",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def _persist_frames_dir(code: str, source: Path, *, require_review: bool = False) -> int:
+    """Land completed artifacts in the official frames directory.
+
+    Returns 0 only when that directory holds them. A container-tmp write alone
+    is a failure, not success.
+    """
+    official = _durable_frames_dir(code)
+    try:
+        if not source.is_dir():
+            raise OSError(errno.ENOENT, "frames directory missing", str(source))
+        _copy_frames_tree(source, official)
+        if _frames_ready(source) and not _frames_ready(official):
+            raise OSError(errno.EIO, "official frames are not ready")
+        if _frames_ready(official):
+            manifest = json.loads((official / "frames_manifest.json").read_text(encoding="utf-8"))
+            for shot in manifest.get("shots") or []:
+                if not (isinstance(shot, dict) and shot.get("ok") and shot.get("valid") is True and shot.get("file")):
+                    continue
+                name = Path(str(shot.get("file"))).name
+                src_file = source / name
+                dst_file = official / name
+                if not src_file.is_file():
+                    continue
+                if not dst_file.is_file() or dst_file.stat().st_size != src_file.stat().st_size:
+                    raise OSError(errno.EIO, f"frame {name} was not persisted")
+        src_review = source / "review.json"
+        dst_review = official / "review.json"
+        if src_review.is_file():
+            if not dst_review.is_file():
+                raise OSError(errno.EIO, "official review.json is missing")
+            if not _same_frames_path(source, official) and dst_review.read_bytes() != src_review.read_bytes():
+                raise OSError(errno.EIO, "official review.json does not match")
+        if require_review and _complete_review(official) is None:
+            raise OSError(errno.EIO, "official review.json is not a dual-model review")
+        src_grok = source / "grok_review.json"
+        if src_grok.is_file():
+            dst_grok = official / "grok_review.json"
+            if not dst_grok.is_file() or dst_grok.read_bytes() != src_grok.read_bytes():
+                raise OSError(errno.EIO, "official grok_review.json is missing")
+            if dst_review.is_file() and dst_review.read_bytes() == dst_grok.read_bytes():
+                raise OSError(errno.EPERM, "review.json matches grok_review.json")
+    except OSError as exc:
+        return _persist_error(code, official, exc)
+    print(f"persist {code}: {official}")
+    return 0
+
+
+def _scratch_has_artifacts(folder: Path) -> bool:
+    if _frames_ready(folder) or _complete_review(folder) is not None:
+        return True
+    return (folder / "grok_review.json").is_file() and (folder / "review.json").is_file()
+
+
+def _select_frames_dir(code: str) -> tuple[Path, int]:
+    """Official frames directory after any container-tmp artifacts are copied in.
+
+    A non-zero return means the durable directory could not be updated.
+    """
+    official = _durable_frames_dir(code)
+    try:
+        official.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return official, _persist_error(code, official, exc)
+    if _frames_ready(official) or _complete_review(official) is not None:
+        return official, 0
+    for folder in _candidate_frames_dirs(code)[1:]:
+        if _same_frames_path(folder, official) or not _scratch_has_artifacts(folder):
+            continue
+        rc = _persist_frames_dir(code, folder)
+        return official, rc
+    return official, 0
+
+
+def _resolve_marker_dir(code: str, marker: str) -> tuple[Path, int]:
+    """Use the official dir, copying a scratch dir that already has marker."""
+    official = _durable_frames_dir(code)
+    if (official / marker).is_file():
+        return official, 0
+    for folder in _candidate_frames_dirs(code)[1:]:
+        if (folder / marker).is_file():
+            rc = _persist_frames_dir(code, folder)
+            return official, rc
+    return official, 0
 
 
 def _frames_ready(folder: Path) -> bool:
@@ -2533,14 +2750,6 @@ def _grok_already_done(folder: Path, trigger: str, code: str) -> bool:
     if str(doc.get("trigger") or "") != trigger:
         return False
     return doc.get("verdict") in _VERDICTS
-
-
-def _select_frames_dir(code: str) -> Path:
-    candidates = _candidate_frames_dirs(code)
-    for folder in candidates:
-        if _frames_ready(folder) or _complete_review(folder) is not None:
-            return folder
-    return candidates[0]
 
 
 def _offline_layout(code: str) -> dict:
@@ -2676,8 +2885,8 @@ def _process_offline_title(code: str) -> int:
     Never submits offline, scrapes, or promotes.
     """
     print(
-        f"PROCESS {code}: clean → strm → frames → review → grok-review（仅 uncertain / 分歧）；"
-        "不交磁、不刮削、不 promote"
+        f"PROCESS {code}: clean → strm → frames → review → grok-review（仅 uncertain / 分歧）"
+        " → 持久帧目录；不交磁、不刮削、不 promote"
     )
     rc = _process_clean(code)
     if rc:
@@ -2685,14 +2894,19 @@ def _process_offline_title(code: str) -> int:
     rc = _process_strm(code)
     if rc:
         return rc
-    folder = _select_frames_dir(code)
+    folder, rc = _select_frames_dir(code)
+    if rc:
+        return rc
     rc = _process_frames(code, folder)
     if rc:
         return rc
     review, rc = _process_review(code, folder)
     if rc:
         return rc
-    return _process_grok(code, folder, review)
+    rc = _process_grok(code, folder, review)
+    if rc:
+        return rc
+    return _persist_frames_dir(code, folder, require_review=True)
 
 
 def cmd_process(args) -> int:
@@ -2778,7 +2992,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("frames", help="对正片 strm 加密抽帧：2分钟起每约8分钟一帧，再补约85%%，最多8帧有效帧；默认预检无效则重抽")
     s.add_argument("code", nargs="?", default="")
     s.add_argument("--strm", default="", help="直接指定 strm 路径")
-    s.add_argument("--out", default="", help="帧输出目录，默认 /tmp/av-auto-frames/<番号>")
+    s.add_argument("--out", default="", help="帧输出目录，默认持久目录 /config/scripts/av-auto-fs/frames/<番号>")
     s.add_argument("--cleanup", action="store_true", help="抽完删除临时帧（保留时间点清单）")
     s.add_argument("--no-precheck", action="store_true", help="跳过有效性预检（官方库只读对时点时用；验证条不要加这个）")
     s.add_argument("--no-reuse", action="store_true", help="不复用已有 jpg，全部重抽")
@@ -2786,7 +3000,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("review", help="仅对有效帧做 DeepSeek-flash + gpt-6-luna 终审；无效帧不送")
     s.add_argument("code")
-    s.add_argument("--out", default="", help="帧目录，默认已有的 av-auto-fs/frames/<番号> 或 /tmp/av-auto-frames/<番号>")
+    s.add_argument("--out", default="", help="帧目录，默认持久目录 /config/scripts/av-auto-fs/frames/<番号>；容器 /tmp 里已有的帧会先复制过去")
     s.add_argument("--cleanup", action="store_true", help="审完删除临时帧（保留清单和 review.json）")
     s.set_defaults(func=cmd_review)
 
@@ -2821,6 +3035,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "处理一个或多个已经完成 115 离线的暂存番号。\n"
             "顺序固定：clean → strm → frames → review → grok-review（仅 uncertain 或两家分歧）。\n"
+            "完成前把帧、review.json（以及若有的 grok_review.json）写入\n"
+            "/config/scripts/av-auto-fs/frames/<番号>/。只留在容器 /tmp 不算完成。\n"
             "已完成的步骤跳过。不重新交磁，不刮削，不搬进 /AV。\n"
             "\n"
             "用法（命令在前，番号在后）：\n"

@@ -18,7 +18,7 @@
 ```
 av_auto setup
 av_auto status
-av_auto submit --code 番号 --url 磁链或ed2k     # 交到 /av-auto/_staging/<番号>/
+av_auto submit --code 番号 --url 磁链或ed2k     # 交到 /av-auto/_staging/<番号>/；ed2k 的 | 不会被 ssh 拆开
 av_auto wait --code 番号 [--timeout 秒]
 av_auto clean --code 番号                      # 只搬正片进 /av-auto/<番号>/，清空残留
 av_auto strm <番号...>                         # 只给正片写 strm，不给广告/杂质建
@@ -33,6 +33,8 @@ av_auto intake --code 番号 --url URI [--frames --review --cleanup]  # 不 prom
 av_auto promote [--dry-run] <番号...>          # 显式搬家；验证条不要自动调用
 ```
 
+`submit` 和 `intake` 的 `--url` 不会原样拼进 ssh 命令行。ed2k 里的 `|`、magnet 里的 `&` 若被远程 shell 再解析一次，会变成管道或后台命令（退出码 126 这一类）。入口把链接写到 Unraid 上 mode 600 的临时文件，远程用 `URI=$(cat file)` 和 `--url "$URI"` 传给 `docker exec`，用完删除。标准输出和 ssh 命令行都不打印链接。
+
 ## 离线完成后：`process`
 
 115 离线已经落到 `/av-auto/_staging/<番号>/` 之后，只用这一条。命令在前，番号在后。可以一次带多个番号。不重新交磁，不刮削，不搬进 `/AV`。
@@ -45,6 +47,8 @@ av_auto process ABP-073 ABP-108 ABP-246 ABP-313 ABP-383
 `av_auto process --help` 也印出上面这条命令。
 
 顺序固定为 clean → strm → frames → review → grok-review。清杂质规则与单独的 `clean` 相同（只留大体积正片，UC/AI/4K 变体可留，广告/apk/宣传/过小 sample 删掉）。抽帧仍是约 2 分钟起、每约 8 分钟一帧、再补约 85%，最多 8 帧，并且默认做有效性预检；没人或完全不色的帧会重抽，仍无效则丢弃，不送终审。终审仍是 DeepSeek-flash + gpt-6-luna。只有 uncertain 或两家分歧才调用 `grok-review`，写同目录 `grok_review.json`，不覆盖 `review.json`。
+
+帧、`review.json` 和若有的 `grok_review.json` 在命令报完成之前写入持久目录 `/config/scripts/av-auto-fs/frames/<番号>/`（宿主机 `/mnt/user/appdata/moviepilot/config/scripts/av-auto-fs/frames/<番号>/`）。容器里的 `/tmp/av-auto-frames/<番号>/` 不会单独算完成；写不进持久目录就是 FAIL。下一轮 process 复用这份持久结果。`frames` / `review` / `grok-review` 单独跑完也会落到同一目录。
 
 已经做过的步骤会跳过：正片已在 `/av-auto/<番号>/`（inbox 夹若还在，只补清残留，不当成失败）、staging strm 已在、预检有效帧已在、双模型 `review.json` 已在、以及未决时对应的 `grok_review.json` 已在。不会因为重跑而再次交离线。
 
@@ -71,10 +75,10 @@ av_auto ABP-073 process
 
 `grok-review` 只读该目录里已经抽出、且预检为有效的帧，请求级临时指定 `cursor/grok-4.7`。提示词里不写两家的结论，Grok 只看这些帧。不重跑 DeepSeek / gpt-6-luna，不送封面、剧照、Thumb、Backdrop，也不送无效帧或空帧。不刮削，不 promote 进 `/AV`，不改 `media_llm_route.json`，不覆盖 `review.json`。先跑完 `grok-review` 再对 `review` 加 `--cleanup`，否则临时帧会被删掉。若后来重跑 `review` 且两家已经一致，再跑 `grok-review` 不会改已有的 `grok_review.json`，以 `review.json` 的一致结论为准。
 
-写出同目录的 `grok_review.json`。`verdict` / `confidence` / `reason` 是 Grok 的判断。`tiebreak.kept_verdict` 是对照两家之后保留的结论：Grok 给出 pass 或 fail 就保留 Grok；Grok 仍为 uncertain 则本条保持未决。`tiebreak.conclusion` 写明保留的是哪一边。标准输出有一行 `tiebreak KEPT <verdict>`、`tiebreak UNRESOLVED uncertain` 或 `tiebreak SKIP <agreement>/<consensus>`。
+写出同目录的 `grok_review.json`。`verdict` / `confidence` / `reason` 是 Grok 的判断。`tiebreak.kept_verdict` 是对照两家之后保留的结论：Grok 给出 pass 或 fail 就保留 Grok；Grok 仍为 uncertain 则本条保持未决。`tiebreak.conclusion` 写明保留的是哪一边。标准输出有一行 `tiebreak KEPT <verdict>`、`tiebreak UNRESOLVED uncertain` 或 `tiebreak SKIP <agreement>/<consensus>`。结果同时落到持久帧目录，不覆盖 `review.json`。
 
 ```bash
-av_auto grok-review IPX-750 --frames-dir /tmp/av-auto-frames/IPX-750
+av_auto grok-review IPX-750 --frames-dir /config/scripts/av-auto-fs/frames/IPX-750
 ```
 
 外部 runner 可以先判断要不要调（这个函数不发请求）：
