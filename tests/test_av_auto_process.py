@@ -507,7 +507,12 @@ class ShellEntryTests(unittest.TestCase):
         self.assertIn("process", logged)
         self.assertIn("--help", logged)
         self.assertIn("bash -s", logged)
-        self.assertIn("llm_runtime.json", logged)
+        self.assertIn("AV_AUTO_LLM_FILE=", logged)
+        self.assertIn("llm_runtime.", logged)
+        self.assertNotIn(
+            "rm -f -- /mnt/user/appdata/moviepilot/config/scripts/av-auto-fs/llm_runtime.json",
+            logged,
+        )
 
     def _invoke(self, tmp: Path, args: list[str]):
         fake = tmp / "bin"

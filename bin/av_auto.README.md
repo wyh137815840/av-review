@@ -28,6 +28,7 @@ av_auto frames --no-precheck                   # 只抽不预检（官方库对�
 av_auto review <番号>                          # 仅有效帧双模型终审（DeepSeek-flash + gpt-6-luna）
 av_auto grok-review <番号> --frames-dir <帧目录>  # 仅 uncertain / 分歧时的 Grok 复审
 av_auto process <番号...>                      # 离线已完成后的官方后处理，见下文
+av_auto share-floor                            # 只读：配置 floor、shfs 是否早于 media.cfg、可用空间。不 reload
 av_auto intake --code 番号 --url URI [--frames --review --cleanup]  # 不 promote
 av_auto promote [--dry-run] <番号...>          # 显式搬家；验证条不要自动调用
 ```
@@ -46,6 +47,12 @@ av_auto process ABP-073 ABP-108 ABP-246 ABP-313 ABP-383
 顺序固定为 clean → strm → frames → review → grok-review。清杂质规则与单独的 `clean` 相同（只留大体积正片，UC/AI/4K 变体可留，广告/apk/宣传/过小 sample 删掉）。抽帧仍是约 2 分钟起、每约 8 分钟一帧、再补约 85%，最多 8 帧，并且默认做有效性预检；没人或完全不色的帧会重抽，仍无效则丢弃，不送终审。终审仍是 DeepSeek-flash + gpt-6-luna。只有 uncertain 或两家分歧才调用 `grok-review`，写同目录 `grok_review.json`，不覆盖 `review.json`。
 
 已经做过的步骤会跳过：正片已在 `/av-auto/<番号>/`（inbox 夹若还在，只补清残留，不当成失败）、staging strm 已在、预检有效帧已在、双模型 `review.json` 已在、以及未决时对应的 `grok_review.json` 已在。不会因为重跑而再次交离线。
+
+`/mnt/user/media` 返回 ENOSPC（errno 28）时，mkdir / strm 仍写入 `av-auto-fs/pending`（`kind` / `path` / `data` 三个文件，给 Unraid 上的 `av_auto_apply_fs` 用）。官方入口在 python 退出之后一定会跑 `av_auto_apply_fs`，即使 process 非 0；以前 `set -e` 会把这一步跳过，人就得手工 apply。同一轮里若 pending 已有该番号的 strm 内容，抽帧直接用这份内容，不再报「找不到 strm」。若这时 `/media` 已经能写，会先把 pending 落到盘上再抽。
+
+ENOSPC 不再一律说成 shareFloor 没重载，也不把还有大量剩余空间的情况说成磁盘满。日志对照三件事：可用空间、`media.cfg` 的 shareFloor、以及 shfs 启动时间是否早于这份 cfg（或运行中的 floor 是否仍高于配置）。可用空间低于 1GiB 才是磁盘满；可用空间低于配置 floor 是预留，reload 也不会放宽；可用空间不低于配置 floor 且 shfs 还没读到新 cfg，才是过期 floor。`av_auto share-floor` 只打印这个诊断，不会 reload shfs，也不会写盘。process 不会自动 reload。
+
+需要 Magpie 的命令每次使用自己的 `llm_runtime.<运行号>.json`，通过 `AV_AUTO_LLM_FILE` 交给容器，退出时只删自己的文件。重叠的官方 process 不会把对方的运行时文件删掉。Key 仍只从 Magpie caller-keys 临时复制，不写进仓库，也不写进永久脚本。
 
 番号不能当子命令。下面这种写法会立刻失败，并提示正确的 `av_auto process ...`，不会把番号当成 cmd：
 

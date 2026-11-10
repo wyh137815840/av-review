@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import json
 import os
 import re
@@ -109,6 +110,12 @@ REVIEW_SYSTEM = (
 
 
 DROP_ROOT = Path("/config/scripts/av-auto-fs/pending")
+# Below this, a failed write is a full disk. Above it, ENOSPC is a floor or reservation.
+FULL_DISK_BYTES = 1024 ** 3
+
+
+class _LeavePending(Exception):
+    """Queued job is not applied in-container. Leave it for av_auto_apply_fs."""
 
 
 def _is_media_path(path: Path) -> bool:
@@ -116,15 +123,351 @@ def _is_media_path(path: Path) -> bool:
     return s.startswith("/media/") or s.startswith("/mnt/user/media/")
 
 
+def _fmt_bytes(n: int | None) -> str:
+    if n is None:
+        return "unknown"
+    if n >= 1024 ** 3:
+        return f"{n / 1024 ** 3:.1f}GiB"
+    if n >= 1024 ** 2:
+        return f"{n / 1024 ** 2:.1f}MiB"
+    return f"{n}B"
+
+
+def _env_int(name: str) -> int | None:
+    raw = (os.environ.get(name) or "").strip()
+    if raw.isdigit():
+        return int(raw)
+    return None
+
+
+def parse_share_floor_kb(text: str) -> int | None:
+    """media.cfg stores shareFloor in KB. Return that integer, or None."""
+    match = re.search(r"shareFloor\s*=\s*\"?(\d+)", text or "")
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _share_cfg_path() -> Path | None:
+    raw = (os.environ.get("AV_AUTO_SHARE_CFG") or "").strip()
+    candidates = [Path(raw)] if raw else []
+    candidates.append(Path("/boot/config/shares/media.cfg"))
+    for path in candidates:
+        try:
+            if path.is_file():
+                return path
+        except OSError:
+            continue
+    return None
+
+
+def _configured_floor_bytes() -> int | None:
+    kb = _env_int("AV_AUTO_SHARE_FLOOR_KB")
+    if kb is None:
+        cfg = _share_cfg_path()
+        if cfg is not None:
+            try:
+                kb = parse_share_floor_kb(cfg.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                kb = None
+    if kb is None:
+        return None
+    return kb * 1024
+
+
+def _live_floor_bytes() -> int | None:
+    kb = _env_int("AV_AUTO_LIVE_FLOOR_KB")
+    if kb is None:
+        return None
+    return kb * 1024
+
+
+def _cfg_mtime() -> float | None:
+    forced = _env_int("AV_AUTO_SHARE_CFG_MTIME")
+    if forced is not None:
+        return float(forced)
+    cfg = _share_cfg_path()
+    if cfg is None:
+        return None
+    try:
+        return cfg.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _shfs_start() -> float | None:
+    forced = _env_int("AV_AUTO_SHFS_START")
+    if forced is None:
+        return None
+    return float(forced)
+
+
+def _stat_free_bytes(path: Path) -> int | None:
+    cur = path
+    for _ in range(8):
+        try:
+            if cur.exists():
+                st = os.statvfs(cur)
+                return int(st.f_bavail) * int(st.f_frsize)
+        except OSError:
+            return None
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    return None
+
+
+def classify_enospc(
+    *,
+    free_bytes: int | None,
+    configured_floor_bytes: int | None = None,
+    live_floor_bytes: int | None = None,
+    cfg_mtime: float | None = None,
+    shfs_start: float | None = None,
+    path: str = "",
+) -> dict:
+    """Explain errno 28 without calling a large free share a full disk.
+
+    kind is full, reservation, stale_floor, not_full, or unknown.
+    A configured floor that is already above free space is a reservation:
+    reloading shfs would still refuse the write. A higher live floor, or a
+    media.cfg newer than the running shfs, is a stale in-memory floor.
+    """
+    where = f" 路径: {path}" if path else ""
+    floor_blocks = (
+        free_bytes is not None
+        and configured_floor_bytes is not None
+        and free_bytes < configured_floor_bytes
+    )
+    above_config = configured_floor_bytes is None or free_bytes is None or free_bytes >= configured_floor_bytes
+    stale_live = (
+        live_floor_bytes is not None
+        and configured_floor_bytes is not None
+        and live_floor_bytes > configured_floor_bytes
+        and above_config
+    )
+    stale_mtime = (
+        cfg_mtime is not None
+        and shfs_start is not None
+        and cfg_mtime > shfs_start
+        and configured_floor_bytes is not None
+        and above_config
+    )
+    if free_bytes is not None and free_bytes < FULL_DISK_BYTES:
+        kind = "full"
+        message = (
+            f"这是磁盘满：可用 {_fmt_bytes(free_bytes)}，低于 1GiB。"
+            "不是 shareFloor 未重载。已排队，但腾出空间之前 /mnt/user/media 上的新目录和 strm 写不进去。"
+        )
+    elif floor_blocks:
+        kind = "reservation"
+        message = (
+            f"不是磁盘满。可用 {_fmt_bytes(free_bytes)} 低于配置 shareFloor {_fmt_bytes(configured_floor_bytes)}，"
+            "写入被 shareFloor 预留拒绝。已排队。reload shfs 不会放宽这份配置。"
+            "pending 里已有的 strm 内容仍可抽帧；新的 /mnt/user/media 写入要等可用空间高于 floor，"
+            "或人改小 floor 并让 shfs 重新加载。本命令不会 reload。"
+        )
+    elif stale_live or stale_mtime:
+        kind = "stale_floor"
+        live_bit = ""
+        if live_floor_bytes is not None:
+            live_bit = f"运行中 floor {_fmt_bytes(live_floor_bytes)} 高于配置。"
+        mtime_bit = ""
+        if cfg_mtime is not None and shfs_start is not None and cfg_mtime > shfs_start:
+            mtime_bit = "shfs 启动早于 media.cfg。"
+        message = (
+            f"不是磁盘满。可用 {_fmt_bytes(free_bytes)}，配置 shareFloor {_fmt_bytes(configured_floor_bytes)}。"
+            f"{live_bit}{mtime_bit}运行中的 shfs 还没吃到这份 floor。已排队经 cache 落盘。"
+            "挡住的是 /mnt/user/media 上的新目录和 strm；pending 里的 strm 内容仍可抽帧。"
+            "官方入口即使 python 非 0 也会跑 av_auto_apply_fs。"
+            "需要人让 shfs 重新读 media.cfg。本命令不会 reload。诊断: av_auto share-floor。"
+        )
+    elif free_bytes is not None and free_bytes >= FULL_DISK_BYTES:
+        kind = "not_full"
+        floor_bit = ""
+        if configured_floor_bytes is not None:
+            floor_bit = f"配置 shareFloor {_fmt_bytes(configured_floor_bytes)}，可用空间不低于该 floor。"
+        message = (
+            f"不是磁盘满。可用 {_fmt_bytes(free_bytes)}，写入仍返回 ENOSPC。{floor_bit}"
+            "这是 shareFloor 或写入预留。不能靠这句话判断 shfs 是否还拿着旧 floor。"
+            "已排队。诊断: av_auto share-floor。本命令不会 reload shfs。"
+            "pending 里的 strm 内容仍可抽帧；官方入口结束时会跑 av_auto_apply_fs。"
+        )
+    else:
+        kind = "unknown"
+        message = (
+            "ENOSPC（errno 28），但没有读到可用空间，不能判断是磁盘满还是 shareFloor。"
+            "不要把它当成磁盘满。已排队。诊断: av_auto share-floor。本命令不会 reload shfs。"
+        )
+    return {"kind": kind, "message": f"NOTE: {message}{where}"}
+
+
+def _enospc_note(path: Path) -> str:
+    return classify_enospc(
+        free_bytes=_stat_free_bytes(path),
+        configured_floor_bytes=_configured_floor_bytes(),
+        live_floor_bytes=_live_floor_bytes(),
+        cfg_mtime=_cfg_mtime(),
+        shfs_start=_shfs_start(),
+        path=str(path),
+    )["message"]
+
+
 def _queue_fs(kind: str, path: Path, text: str | None = None) -> None:
     DROP_ROOT.mkdir(parents=True, exist_ok=True)
-    job = DROP_ROOT / f"{time.time_ns()}"
-    job.mkdir()
+    job: Path | None = None
+    for _ in range(5):
+        candidate = DROP_ROOT / f"{time.time_ns()}"
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            continue
+        job = candidate
+        break
+    if job is None:
+        raise OSError(errno.ENOSPC, f"pending queue collision for {path}")
     (job / "kind").write_text(kind, encoding="utf-8")
     (job / "path").write_text(str(path), encoding="utf-8")
     if text is not None:
         (job / "data").write_text(text, encoding="utf-8")
-    print(f"NOTE: /mnt/user/media 暂不可写（ENOSPC，shfs 未吃到新 shareFloor），已排队经 cache 落盘: {path}")
+    print(_enospc_note(path), flush=True)
+
+
+def _pending_jobs() -> list[Path]:
+    root = DROP_ROOT
+    try:
+        if not root.is_dir():
+            return []
+        jobs = [
+            p for p in root.iterdir()
+            if p.is_dir() and (p / "kind").is_file() and (p / "path").is_file()
+        ]
+    except OSError:
+        return []
+    return sorted(jobs, key=lambda p: p.name)
+
+
+def _perform_pending_job(job: Path) -> None:
+    kind = (job / "kind").read_text(encoding="utf-8").strip()
+    path = Path((job / "path").read_text(encoding="utf-8").strip())
+    if not _is_media_path(path):
+        raise _LeavePending()
+    data = ""
+    data_path = job / "data"
+    if data_path.is_file():
+        data = data_path.read_text(encoding="utf-8")
+    if kind == "mkdir":
+        path.mkdir(parents=True, exist_ok=True)
+    elif kind == "write_text":
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(data, encoding="utf-8")
+    elif kind == "rmtree":
+        if path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+    else:
+        raise _LeavePending()
+
+
+def apply_pending_queue() -> tuple[int, int]:
+    """Retry queued media writes. ENOSPC leaves the job for host apply_fs.
+
+    Does not reload shfs. Paths outside /media and /mnt/user/media stay queued.
+    """
+    applied = 0
+    blocked = 0
+    for job in _pending_jobs():
+        try:
+            _perform_pending_job(job)
+        except _LeavePending:
+            continue
+        except OSError as exc:
+            if exc.errno == errno.ENOSPC:
+                blocked += 1
+                continue
+            print(f"WARN: pending {job.name} 未能应用: errno={exc.errno}", flush=True)
+            continue
+        shutil.rmtree(job, ignore_errors=True)
+        applied += 1
+    return applied, blocked
+
+
+def _queued_path_is_strm(queued: str, code: str) -> bool:
+    name = Path(queued).name
+    if not name.lower().endswith(".strm"):
+        return False
+    stem = Path(name).stem.upper()
+    parent = Path(queued).parent.name.upper()
+    return stem == code or parent == code
+
+
+def _pending_strm_payload(code: str) -> tuple[str, str] | None:
+    code = _norm_code(code)
+    best: tuple[str, str, str] | None = None
+    for job in _pending_jobs():
+        try:
+            kind = (job / "kind").read_text(encoding="utf-8").strip()
+            queued = (job / "path").read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if kind != "write_text" or not _queued_path_is_strm(queued, code):
+            continue
+        data_path = job / "data"
+        if not data_path.is_file():
+            continue
+        try:
+            text = data_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if "http" not in text:
+            continue
+        if best is None or job.name > best[0]:
+            best = (job.name, queued, text)
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
+def _materialize_pending_strm(code: str) -> Path | None:
+    found = _pending_strm_payload(code)
+    if found is None:
+        return None
+    queued, text = found
+    code = _norm_code(code)
+    root = Path(os.environ.get("AV_AUTO_PENDING_STRM_ROOT", "/tmp/av-auto-pending-strm"))
+    dest = root / code / f"{code}.strm"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+    print(
+        f"NOTE: {code} 的 strm 还在 pending（{queued}），不报缺失。"
+        f"已用排队内容写到 {dest} 再抽帧。"
+        "/media 上的目录和 strm 仍等 av_auto_apply_fs（process 非 0 也会跑）。",
+        flush=True,
+    )
+    return dest
+
+
+def _resolve_strm_for_code(code: str, paths: dict) -> Path | None:
+    """Use a real strm if a retry just landed it; otherwise the pending payload."""
+    apply_pending_queue()
+    try:
+        found = _find_strm_for_code(code, paths)
+    except (ImportError, ModuleNotFoundError):
+        found = None
+    if found is not None:
+        return found
+    return _materialize_pending_strm(code)
+
+
+def _strm_for_frames(code: str, paths: dict) -> Path:
+    found = _resolve_strm_for_code(code, paths)
+    if found is None:
+        _die(
+            f"找不到 {code} 的 strm（staging {paths['staging_strm']}/{code} 或正式库）。"
+            "空目录请不要为测试拷片。"
+        )
+    return found
 
 
 def media_mkdir(path: Path) -> None:
@@ -1047,9 +1390,7 @@ def cmd_frames(args) -> int:
     if args.strm:
         strm = Path(args.strm)
     elif code:
-        strm = _find_strm_for_code(code, paths)
-        if strm is None:
-            _die(f"找不到 {code} 的 strm（staging {paths['staging_strm']}/{code} 或正式库）。空目录请不要为测试拷片。")
+        strm = _strm_for_frames(code, paths)
     else:
         _die("用法: av_auto frames 番号  或  av_auto frames --strm /path/file.strm")
     if not strm.is_file():
@@ -2260,8 +2601,16 @@ def _process_clean(code: str) -> int:
 
 
 def _process_strm(code: str) -> int:
+    apply_pending_queue()
     if _staging_strm_ready(code):
         print(f"SKIP strm {code}: staging strm 已存在")
+        return 0
+    if _pending_strm_payload(code):
+        print(
+            f"NOTE: {code} 的 staging strm 已在 pending，不再重复排队。"
+            "抽帧使用排队内容；盘上的文件由 av_auto_apply_fs 落盘。",
+            flush=True,
+        )
         return 0
     return int(cmd_strm(argparse.Namespace(codes=[code])) or 0)
 
@@ -2360,6 +2709,9 @@ def cmd_process(args) -> int:
         codes.append(_norm_code(str(raw)))
     if not codes:
         _die(f"用法: av_auto process 番号 [番号...]  例如: {PROCESS_EXAMPLE}", 2)
+    # Land an earlier run's pending writes if /media accepts them now.
+    # A stale shareFloor still leaves the jobs for the host apply_fs.
+    apply_pending_queue()
     failed: list[str] = []
     for code in codes:
         try:

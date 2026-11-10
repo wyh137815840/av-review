@@ -2,9 +2,13 @@
 # grokbot-vm entry
 # For frames/review/grok-review/process, drop a short-lived Magpie caller-keys copy
 # into the moviepilot volume so av_auto.py can call Magpie without baking secrets in.
+# Each official run uses its own llm_runtime file. The EXIT trap removes only that
+# file, so one run cannot delete the file another official run still has open.
 # grok-review is the tiebreaker only. It does not change the default review models.
 # process is the post-offline path and runs that tiebreaker only when review is unresolved.
 # A catalog code is never a subcommand: `av_auto ABP-073 clean` stops here.
+# set -e must not skip av_auto_apply_fs when python exits non-zero. Pending
+# mkdir/write_text jobs are how strm lands after shfs returns ENOSPC.
 set -euo pipefail
 
 # Keep in sync with looks_like_catalog_code() / code_as_command_message() in scripts/av_auto.py.
@@ -13,6 +17,8 @@ CATALOG_CODE_RE='^([Ff][Cc]2([-_]?[Pp][Pp][Vv])?[-_]?[0-9]{5,}|[A-Za-z]{2,10}-[0
 is_catalog_code() {
   [[ "${1:-}" =~ $CATALOG_CODE_RE ]]
 }
+
+is_num() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 
 cmd_tokens=("$@")
 if [[ "${cmd_tokens[0]:-}" == "--" ]]; then
@@ -37,8 +43,73 @@ if ((${#cmd_tokens[@]})) && is_catalog_code "${cmd_tokens[0]}"; then
   exit 2
 fi
 
+# Read-only probe of the Unraid host. Does not reload shfs and does not write.
+probe_share_floor() {
+  ssh -o BatchMode=yes root@192.168.1.9 'cfg=/boot/config/shares/media.cfg; floor=""; mtime=""; start=""; free=""; if [ -f "$cfg" ]; then floor=$(sed -n "s/.*shareFloor=\"\{0,1\}\([0-9][0-9]*\).*/\1/p" "$cfg" | head -n 1); mtime=$(stat -c %Y "$cfg" 2>/dev/null || true); fi; pid=$(pidof shfs 2>/dev/null | cut -d" " -f1); if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then start=$(stat -c %Y "/proc/$pid" 2>/dev/null || true); fi; if [ -d /mnt/user/media ]; then free=$(df -B1 --output=avail /mnt/user/media 2>/dev/null | tail -n 1 | tr -d " "); fi; printf "floor=%s\nmtime=%s\nstart=%s\nfree=%s\n" "$floor" "$mtime" "$start" "$free"'
+}
+
+report_share_floor() {
+  local floor="$1" mtime="$2" start="$3" free="$4"
+  local stale=0 below=0
+  echo "share-floor 只读诊断。不会 reload shfs，不会写盘，不会跑 process。"
+  echo "configured shareFloor KB: ${floor:-unknown}"
+  echo "media.cfg mtime epoch: ${mtime:-unknown}"
+  echo "shfs start epoch: ${start:-unknown}"
+  echo "free bytes on /mnt/user/media: ${free:-unknown}"
+  if is_num "$mtime" && is_num "$start" && [ "$mtime" -gt "$start" ]; then
+    stale=1
+  fi
+  if is_num "$free" && is_num "$floor" && [ "$free" -lt $((floor * 1024)) ]; then
+    below=1
+  fi
+  if is_num "$free" && [ "$free" -lt 1073741824 ]; then
+    echo "判定: 可用空间低于 1GiB。这是磁盘满，不是过期 shareFloor。"
+  elif [ "$below" -eq 1 ]; then
+    echo "判定: 不是磁盘满。可用空间低于配置 shareFloor，写入会被这份预留拒绝。reload 不会放宽已写入 cfg 的 floor。"
+  elif [ "$stale" -eq 1 ]; then
+    echo "判定: 不是磁盘满。shfs 启动早于 media.cfg 修改，运行中的 shareFloor 还没吃到这份配置。可用空间不低于配置 floor 时，ENOSPC 是过期 floor。"
+  elif is_num "$free"; then
+    echo "判定: 不是磁盘满。可用空间还在，但信息不够就不能把 ENOSPC 说成过期 floor 或预留。对照上面的 floor、shfs 启动时间和可用空间。"
+  else
+    echo "判定: 信息不全。不要把 ENOSPC 说成磁盘满。"
+  fi
+  echo "挡住的是经 shfs 的 /mnt/user/media 新建目录和 strm。pending 里已有的 strm 内容仍可抽帧。av_auto 在 python 退出后会跑 av_auto_apply_fs，即使 process 非 0。让 shfs 重新读 media.cfg 要人来做。"
+}
+
+load_share_floor_probe() {
+  local probe_out probe_rc
+  SHARE_FLOOR_KB=""
+  SHARE_CFG_MTIME=""
+  SHFS_START=""
+  SHARE_FREE=""
+  PROBE_RC=0
+  set +e
+  probe_out=$(probe_share_floor)
+  probe_rc=$?
+  set -e
+  PROBE_RC=$probe_rc
+  if [ "$probe_rc" -ne 0 ]; then
+    return "$probe_rc"
+  fi
+  SHARE_FLOOR_KB=$(printf '%s\n' "$probe_out" | sed -n 's/^floor=//p' | head -n 1)
+  SHARE_CFG_MTIME=$(printf '%s\n' "$probe_out" | sed -n 's/^mtime=//p' | head -n 1)
+  SHFS_START=$(printf '%s\n' "$probe_out" | sed -n 's/^start=//p' | head -n 1)
+  SHARE_FREE=$(printf '%s\n' "$probe_out" | sed -n 's/^free=//p' | head -n 1)
+  return 0
+}
+
+if [ "${1:-}" = "share-floor" ]; then
+  if ! load_share_floor_probe; then
+    echo "ERROR: 读 media.cfg / shfs 失败（ssh ${PROBE_RC}）。没有 reload。" >&2
+    exit "$PROBE_RC"
+  fi
+  report_share_floor "$SHARE_FLOOR_KB" "$SHARE_CFG_MTIME" "$SHFS_START" "$SHARE_FREE"
+  exit 0
+fi
+
 LLM_SRC=/mnt/user/appdata/magpie/config/magpie/caller-keys.json
-LLM_DST=/mnt/user/appdata/moviepilot/config/scripts/av-auto-fs/llm_runtime.json
+LLM_DST=""
+LLM_CONTAINER=""
 need_llm=0
 case "${1:-}" in
   frames|review|grok-review|process) need_llm=1 ;;
@@ -57,13 +128,45 @@ if [ "${1:-}" = "frames" ]; then
   for a in "$@"; do
     [ "$a" = "--no-precheck" ] && skip=1
   done
-  need_llm=$((1-skip))
+  need_llm=$((1 - skip))
 fi
 
 cleanup_llm() {
-  ssh -o BatchMode=yes root@192.168.1.9 "rm -f $LLM_DST"
+  if [ -z "${LLM_DST:-}" ]; then
+    return 0
+  fi
+  # Only this run's file. Never rm the shared llm_runtime.json name.
+  ssh -o BatchMode=yes root@192.168.1.9 "rm -f -- ${LLM_DST}" || true
 }
+
 if [ "$need_llm" = 1 ]; then
+  run_id="${RANDOM}-$$-$(date +%s)"
+  LLM_DST="/mnt/user/appdata/moviepilot/config/scripts/av-auto-fs/llm_runtime.${run_id}.json"
+  LLM_CONTAINER="/config/scripts/av-auto-fs/llm_runtime.${run_id}.json"
+  trap cleanup_llm EXIT
+fi
+
+if ! load_share_floor_probe; then
+  echo "NOTE: 没能读到 media.cfg / shfs 启动时间（ssh ${PROBE_RC}）。ENOSPC 时仍不会把还有剩余空间的情况说成磁盘满。" >&2
+fi
+
+docker_env=(-e PYTHONUNBUFFERED=1)
+if is_num "${SHARE_FLOOR_KB:-}"; then
+  docker_env+=(-e "AV_AUTO_SHARE_FLOOR_KB=${SHARE_FLOOR_KB}")
+fi
+if is_num "${SHARE_CFG_MTIME:-}"; then
+  docker_env+=(-e "AV_AUTO_SHARE_CFG_MTIME=${SHARE_CFG_MTIME}")
+fi
+if is_num "${SHFS_START:-}"; then
+  docker_env+=(-e "AV_AUTO_SHFS_START=${SHFS_START}")
+fi
+if [ -n "$LLM_CONTAINER" ]; then
+  docker_env+=(-e "AV_AUTO_LLM_FILE=${LLM_CONTAINER}")
+fi
+
+rc=0
+if [ "$need_llm" = 1 ]; then
+  set +e
   ssh -o BatchMode=yes root@192.168.1.9 bash -s << REMOTE
 set -euo pipefail
 mkdir -p "$(dirname "$LLM_DST")"
@@ -73,9 +176,29 @@ gid=\$(docker exec moviepilot id -g)
 chown "\$uid:\$gid" "$LLM_DST"
 chmod 600 "$LLM_DST"
 REMOTE
-  trap cleanup_llm EXIT
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    echo "ERROR: 未能放入本次运行的 Magpie caller-keys（${rc}）。没有把 Key 写进仓库或脚本。" >&2
+  fi
 fi
-ssh -o BatchMode=yes root@192.168.1.9 docker exec moviepilot python3 /config/scripts/av_auto.py "$@"
-rc=$?
+
+if [ "$rc" -eq 0 ]; then
+  set +e
+  ssh -o BatchMode=yes root@192.168.1.9 docker exec "${docker_env[@]}" moviepilot python3 /config/scripts/av_auto.py "$@"
+  rc=$?
+  set -e
+fi
+
+# Always apply, including when python exited non-zero. set -e used to skip this.
+set +e
 ssh -o BatchMode=yes root@192.168.1.9 /mnt/user/appdata/findav/bin/av_auto_apply_fs
-exit $rc
+apply_rc=$?
+set -e
+if [ "$apply_rc" -ne 0 ]; then
+  echo "ERROR: av_auto_apply_fs 退出 ${apply_rc}。pending 里的 mkdir/write_text 可能还没落到 /mnt/user/media。" >&2
+fi
+if [ "$rc" -ne 0 ]; then
+  exit "$rc"
+fi
+exit "$apply_rc"
