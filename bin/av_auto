@@ -1,5 +1,46 @@
 #!/bin/bash
 # grokbot-vm entry
+# For frames/review, drop a short-lived Magpie caller-keys copy into the
+# moviepilot volume so av_auto.py can precheck/review without baking secrets in.
+set -euo pipefail
+LLM_SRC=/mnt/user/appdata/magpie/config/magpie/caller-keys.json
+LLM_DST=/mnt/user/appdata/moviepilot/config/scripts/av-auto-fs/llm_runtime.json
+need_llm=0
+case "${1:-}" in
+  frames|review) need_llm=1 ;;
+esac
+if [ "${1:-}" = "intake" ]; then
+  for a in "$@"; do
+    case "$a" in
+      --frames|--review) need_llm=1 ;;
+    esac
+  done
+fi
+# --no-precheck still may call review; keep injection if review is requested.
+# If only frames --no-precheck, skip injection.
+if [ "${1:-}" = "frames" ]; then
+  skip=0
+  for a in "$@"; do
+    [ "$a" = "--no-precheck" ] && skip=1
+  done
+  need_llm=$((1-skip))
+fi
+
+cleanup_llm() {
+  ssh -o BatchMode=yes root@192.168.1.9 "rm -f $LLM_DST"
+}
+if [ "$need_llm" = 1 ]; then
+  ssh -o BatchMode=yes root@192.168.1.9 bash -s << REMOTE
+set -euo pipefail
+mkdir -p "$(dirname "$LLM_DST")"
+install -m 600 "$LLM_SRC" "$LLM_DST"
+uid=\$(docker exec moviepilot id -u)
+gid=\$(docker exec moviepilot id -g)
+chown "\$uid:\$gid" "$LLM_DST"
+chmod 600 "$LLM_DST"
+REMOTE
+  trap cleanup_llm EXIT
+fi
 ssh -o BatchMode=yes root@192.168.1.9 docker exec moviepilot python3 /config/scripts/av_auto.py "$@"
 rc=$?
 ssh -o BatchMode=yes root@192.168.1.9 /mnt/user/appdata/findav/bin/av_auto_apply_fs

@@ -12,6 +12,7 @@ Promote is explicit and never automatic.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -20,8 +21,12 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 PLUGIN_DIR = Path("/config/plugins/av115scraper")
 USER_DB = Path(os.environ.get("MP_USER_DB", "/config/user.db"))
@@ -42,6 +47,38 @@ SEEK_STEP = 480           # 8 minutes
 SEEK_MAX_FRAMES = 8
 SEEK_TAIL_GUARD = 90      # avoid end credits
 SEEK_DEDUP = 30
+PRECHECK_RETRIES = 3      # plus the first attempt
+LLM_RUNTIME = Path("/config/scripts/av-auto-fs/llm_runtime.json")
+MAGPIE_DEFAULT = "http://192.168.1.9:3430"
+PRECHECK_MODEL = "deepseek/deepseek-flash"
+REVIEW_MODELS = ("deepseek/deepseek-flash", "chatgpt-api/gpt-6-luna")
+FORBIDDEN_MODEL_BITS = ("minimax", "grok")
+PRECHECK_TO = int(os.environ.get("AV_AUTO_PRECHECK_TIMEOUT", "90"))
+REVIEW_TO = int(os.environ.get("AV_AUTO_REVIEW_TIMEOUT", "180"))
+TZ = ZoneInfo("Asia/Shanghai")
+
+PRECHECK_SYSTEM = (
+    "你是抽帧有效性预检器，不是终审。只根据这一张图判断。"
+    "无效（valid=false）仅当以下任一明确成立："
+    "1) 画面里完全没有人（空景、黑屏、纯字幕卡、纯商标等）；"
+    "2) 画面完全不色：没有色情、裸露、性行为，也没有明显色气的身体展示，只是日常空景、对白/胡聊、字幕、片头片尾等。"
+    "其余情况 valid=true（包括看不清或不确定——交给终审，不要误杀）。"
+    "只输出一个 JSON 对象，不要 Markdown，不要其它文字："
+    '{"valid":true或false,"reason":"一句短理由","confidence":"high|mid|low"}。'
+)
+
+REVIEW_SYSTEM = (
+    "你是影视库筛选助手。用户偏好：身材要好、不要干扁；不要显老，要年轻、皮肤白、水嫩；"
+    "预览不要狰狞表情（「色不是难受」）。色情题材、裸露、性行为本身不判负。"
+    "只根据所附抽帧里女优的可见外观判断，不要因为片名、类型标签（如人妻、熟女）本身判负。"
+    "判定维度仅限：dry_thin（身材干扁）、looks_old（显老）、poor_skin（皮肤差/暗沉、明显不白不水嫩）、"
+    "grimace（狰狞或难受表情，含看起来痛苦的夸张白目/失神）。"
+    "スレンダー不要单独判成干扁；人妻/熟女/老片/蜜色不单独判负。"
+    "只输出一个 JSON 对象，不要 Markdown，不要其它文字。字段："
+    '{"verdict":"pass|fail|uncertain","hits":[],"reason":"一句短理由","confidence":"high|mid|low"}。'
+    "verdict=fail：至少一项维度在图中较明确；pass：未见明显不符；uncertain：看不清、角度限制或证据冲突。"
+    "只使用有效抽帧；不要根据无效空景或纯字幕想象内容。"
+)
 
 
 DROP_ROOT = Path("/config/scripts/av-auto-fs/pending")
@@ -506,6 +543,319 @@ def _run_ff(args: list[str], timeout: int) -> subprocess.CompletedProcess:
     return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
 
 
+def _assert_allowed_model(name: str) -> str:
+    n = (name or "").strip()
+    low = n.lower()
+    if any(bit in low for bit in FORBIDDEN_MODEL_BITS):
+        _die(f"拒绝模型 {n}：不上 MiniMax/Grok，不改 media_llm_route")
+    return n
+
+
+def _load_llm_runtime() -> dict:
+    """Read Magpie caller key from a short-lived runtime file. Never print secrets."""
+    path = Path(os.environ.get("AV_AUTO_LLM_FILE") or LLM_RUNTIME)
+    if not path.is_file():
+        _die(f"找不到 LLM 运行时文件 {path}。请用官方入口 av_auto（会临时放入 Magpie caller-keys），不要把手写 Key 写进脚本。")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        _die("LLM 运行时文件无法解析（不打印内容）")
+    key = ""
+    url = MAGPIE_DEFAULT
+    precheck_model = PRECHECK_MODEL
+    review_models = list(REVIEW_MODELS)
+    if isinstance(raw, dict):
+        url = (raw.get("magpie_url") or raw.get("base_url") or url).rstrip("/")
+        key = (raw.get("api_key") or raw.get("secret") or raw.get("key") or "").strip()
+        precheck_model = raw.get("precheck_model") or precheck_model
+        if raw.get("review_models"):
+            review_models = list(raw["review_models"])
+        items = raw.get("keys") or raw.get("caller_keys") or []
+    else:
+        items = raw if isinstance(raw, list) else []
+    if not key:
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            secret = (it.get("secret") or it.get("key") or it.get("api_key") or "").strip()
+            if secret and it.get("enabled", True) is not False:
+                key = secret
+                break
+    if not key:
+        _die("LLM 运行时文件里没有可用的 Magpie Key")
+    precheck_model = _assert_allowed_model(precheck_model)
+    review_models = [_assert_allowed_model(m) for m in review_models]
+    return {"url": url, "key": key, "precheck_model": precheck_model, "review_models": review_models}
+
+
+def _parse_json_obj(text: str) -> dict | None:
+    s = (text or "").strip()
+    if not s:
+        return None
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", s, re.S)
+    if not m:
+        return None
+    try:
+        obj = json.loads(m.group(0))
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _ds_peak(ts: datetime | None = None) -> bool:
+    t = ts or datetime.now(TZ)
+    if t.weekday() >= 5:
+        return False
+    return (9 <= t.hour < 12) or (14 <= t.hour < 18)
+
+
+def _cost_of(usages: list[dict], started: datetime | None = None) -> dict:
+    """Currency only in summaries; keep raw usage in the manifest for local audit."""
+    peak = _ds_peak(started)
+    ds_in = ds_cache = ds_out = 0
+    lu_in = lu_out = 0
+    for u in usages:
+        if not isinstance(u, dict):
+            continue
+        model = (u.get("model") or u.get("model_requested") or "").lower()
+        prompt = int(u.get("prompt_tokens") or 0)
+        details = u.get("prompt_tokens_details") or {}
+        cached = int(details.get("cached_tokens") or 0) if isinstance(details, dict) else 0
+        uncached = max(prompt - cached, 0)
+        out = int(u.get("completion_tokens") or 0)
+        is_ds = "deepseek-flash" in model or model.endswith("/deepseek-flash") or model == "deepseek-flash"
+        is_lu = "gpt-6-luna" in model or "luna" in model
+        if is_ds:
+            ds_in += uncached
+            ds_cache += cached
+            ds_out += out
+        elif is_lu:
+            lu_in += prompt
+            lu_out += out
+    mul = 1.0 if peak else 0.5
+    ds_cny = ds_in * 2.0 * mul / 1e6 + ds_cache * 0.04 * mul / 1e6 + ds_out * 8.0 * mul / 1e6
+    lu_usd = lu_in * 0.10 / 1e6 + lu_out * 0.50 / 1e6
+    return {
+        "peak": peak,
+        "deepseek_cny": round(ds_cny, 4),
+        "luna_usd_est": round(lu_usd, 4),
+    }
+
+
+def _data_uri(path: Path) -> str:
+    raw = path.read_bytes()
+    mime = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}.get(path.suffix.lower(), "image/jpeg")
+    return f"data:{mime};base64," + base64.b64encode(raw).decode()
+
+
+def _magpie_chat(cfg: dict, model: str, images: list[Path], system: str, user_text: str, timeout: int, max_tokens: int) -> dict:
+    model = _assert_allowed_model(model)
+    content = [{"type": "text", "text": user_text}]
+    for img in images:
+        content.append({"type": "image_url", "image_url": {"url": _data_uri(img)}})
+    body = {
+        "model": model,
+        "temperature": 0.1,
+        "max_tokens": max_tokens,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": content},
+        ],
+    }
+    req = urllib.request.Request(
+        cfg["url"] + "/v1/chat/completions",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Authorization": "Bearer " + cfg["key"], "Content-Type": "application/json"},
+        method="POST",
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    t0 = time.time()
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            payload = json.loads(r.read().decode())
+            msg = ((payload.get("choices") or [{}])[0].get("message") or {})
+            raw = msg.get("content") or ""
+            parsed = _parse_json_obj(raw)
+            usage = payload.get("usage") or {}
+            if isinstance(usage, dict):
+                usage = dict(usage)
+                usage["model"] = payload.get("model") or model
+            return {
+                "ok": True,
+                "http": r.status,
+                "elapsed_s": round(time.time() - t0, 2),
+                "model_requested": model,
+                "model_echo": payload.get("model"),
+                "raw_content": (raw or "")[:2000],
+                "parsed": parsed,
+                "usage": usage,
+            }
+    except urllib.error.HTTPError as e:
+        err = e.read().decode("utf-8", "replace")[:300]
+        return {
+            "ok": False,
+            "http": e.code,
+            "elapsed_s": round(time.time() - t0, 2),
+            "model_requested": model,
+            "error": f"HTTP {e.code} {_redact_media(err)}",
+            "retryable": e.code in (422, 429, 500, 502, 503, 504),
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "http": None,
+            "elapsed_s": round(time.time() - t0, 2),
+            "model_requested": model,
+            "error": _redact_media(f"{type(e).__name__}: {e}")[:300],
+            "retryable": "timeout" in type(e).__name__.lower() or "timed out" in str(e).lower(),
+        }
+
+
+def _chat_retry(cfg, model, images, system, user_text, timeout, max_tokens, tries=3) -> dict:
+    last = {}
+    for i in range(1, tries + 1):
+        rec = _magpie_chat(cfg, model, images, system, user_text, timeout, max_tokens)
+        rec["attempts"] = i
+        last = rec
+        if rec.get("ok") and rec.get("parsed"):
+            return rec
+        if not rec.get("retryable") and not (rec.get("ok") and not rec.get("parsed")):
+            return rec
+        time.sleep(2 * i)
+    return last
+
+
+def _precheck_image(cfg: dict, path: Path, code: str, label: str, ss: int) -> dict:
+    user = f"番号 {code} 抽帧 {label} @{ss}s。请判断这一张是否为有效帧，只输出 JSON。"
+    rec = _chat_retry(cfg, cfg["precheck_model"], [path], PRECHECK_SYSTEM, user, PRECHECK_TO, 200)
+    parsed = rec.get("parsed") or {}
+    valid = parsed.get("valid")
+    # API/parse failure: do not discard the frame; final review can still see it.
+    if valid is not True and valid is not False:
+        if rec.get("ok"):
+            valid = True
+            reason = "预检响应无法解析，先当作有效交给终审"
+            confidence = "low"
+            error = "parse"
+        else:
+            valid = True
+            reason = f"预检调用失败，先当作有效交给终审（{rec.get('error') or 'error'}）"
+            confidence = "low"
+            error = rec.get("error") or "call"
+        uncertain = True
+    else:
+        reason = parsed.get("reason") or ""
+        confidence = parsed.get("confidence") or ""
+        error = ""
+        uncertain = False
+    return {
+        "valid": bool(valid),
+        "reason": reason,
+        "confidence": confidence,
+        "model": rec.get("model_echo") or rec.get("model_requested"),
+        "elapsed_s": rec.get("elapsed_s"),
+        "usage": rec.get("usage") or {},
+        "error": error,
+        "uncertain": uncertain,
+        "http": rec.get("http"),
+        "attempts": rec.get("attempts") or 1,
+    }
+
+
+def _nearby_times(ss: int, nxt: int | None, duration: float, used: set[int]) -> list[int]:
+    """Up to 3 later points between ss and the next planned time (or tail guard)."""
+    cap = int(duration - SEEK_TAIL_GUARD) if duration else ss + 180
+    if cap <= ss + 1:
+        cap = int(duration - 2) if duration else ss + 60
+    hi = cap
+    if nxt is not None:
+        hi = min(hi, int(nxt) - SEEK_DEDUP)
+    out: list[int] = []
+
+    def ok(t: int) -> bool:
+        if t <= ss or t >= (duration or t + 1) - 1:
+            return False
+        if t > cap:
+            return False
+        if any(abs(t - u) < SEEK_DEDUP for u in used):
+            return False
+        if any(abs(t - x) < SEEK_DEDUP for x in out):
+            return False
+        return True
+
+    span = hi - ss
+    fracs = (0.25, 0.50, 0.75) if span >= 3 * SEEK_DEDUP else (0.33, 0.66, 0.90)
+    for frac in fracs:
+        t = int(round(ss + max(span, SEEK_DEDUP * 2) * frac))
+        if ok(t):
+            out.append(t)
+        if len(out) >= PRECHECK_RETRIES:
+            return out
+    # tight gap: walk forward in 45s steps, then a little backward if still short
+    t = ss + 45
+    while len(out) < PRECHECK_RETRIES and t <= cap:
+        if ok(t):
+            out.append(t)
+        t += 45
+    t = ss - 45
+    floor = SEEK_START if duration and duration >= SEEK_START else 5
+    while len(out) < PRECHECK_RETRIES and t >= floor:
+        if ok(t):
+            out.append(t)
+        t -= 45
+    return out[:PRECHECK_RETRIES]
+
+
+def _extract_one(media: str, dest: Path, ss: int) -> dict:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        dest.unlink()
+    row = {"ss": ss, "ok": False, "degraded": False, "bytes": 0, "error": ""}
+    try:
+        fr = _run_ff(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-ss",
+                str(ss),
+                "-i",
+                media,
+                "-frames:v",
+                "1",
+                "-q:v",
+                "2",
+                "-vf",
+                "scale=w='min(800,iw)':h=-2",
+                str(dest),
+            ],
+            FRAME_TO,
+        )
+    except subprocess.TimeoutExpired:
+        row["degraded"] = True
+        row["error"] = f"seek timeout {FRAME_TO}s"
+        return row
+    if fr.returncode == 0 and dest.is_file() and dest.stat().st_size > 500:
+        row["ok"] = True
+        row["bytes"] = dest.stat().st_size
+        return row
+    row["degraded"] = True
+    row["error"] = _redact_media((fr.stderr or "")[-200:]) or f"ffmpeg rc={fr.returncode}"
+    if dest.exists():
+        dest.unlink()
+    return row
+
+
 def _find_strm_for_code(code: str, paths: dict) -> Path | None:
     sys.path.insert(0, str(PLUGIN_DIR))
     from av115_library import safe_name
@@ -550,6 +900,9 @@ def cmd_frames(args) -> int:
     code = code or strm.stem
     out = Path(args.out) if args.out else Path(f"/tmp/av-auto-frames/{code}")
     out.mkdir(parents=True, exist_ok=True)
+    precheck = not bool(getattr(args, "no_precheck", False))
+    reuse = not bool(getattr(args, "no_reuse", False))
+    llm = _load_llm_runtime() if precheck else None
     src = _read_strm_url(strm)
     print(f"strm: {strm}")
     print(f"redirect host: {_host_only(src)}")
@@ -598,68 +951,140 @@ def cmd_frames(args) -> int:
     labels = ", ".join(f"{l}@{ss}s" for l, ss in pts)
     cap_note = " 触顶8帧" if meta.get("capped") else ""
     print(f"seek: {labels}{cap_note}")
+    if precheck:
+        print(f"precheck: {llm['precheck_model']} 一家；无效则在该点附近重抽，单点最多 {PRECHECK_RETRIES} 次")
     ok = 0
+    valid_n = 0
+    discarded = []
     degraded = []
     shots = []
-    for label, ss in pts:
-        dest = out / f"{code}_{label}.jpg"
-        row = {"label": label, "ss": ss, "ok": False, "degraded": False, "bytes": 0}
-        try:
-            fr = _run_ff(
-                [
-                    "ffmpeg",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-y",
-                    "-ss",
-                    str(ss),
-                    "-i",
-                    media,
-                    "-frames:v",
-                    "1",
-                    "-q:v",
-                    "2",
-                    "-vf",
-                    "scale=w='min(800,iw)':h=-2",
-                    str(dest),
-                ],
-                FRAME_TO,
-            )
-        except subprocess.TimeoutExpired:
-            print(f"DEGRADE {label} @{ss}s seek timeout {FRAME_TO}s，跳过，不堵整批")
-            row["degraded"] = True
-            degraded.append(f"{label}@{ss}s timeout")
-            shots.append(row)
-            continue
-        if fr.returncode == 0 and dest.is_file() and dest.stat().st_size > 500:
-            print(f"OK {label} @{ss}s bytes={dest.stat().st_size}")
-            row["ok"] = True
-            row["bytes"] = dest.stat().st_size
+    usages = []
+    used: set[int] = set()
+    started = datetime.now(TZ)
+    for i, (label, ss) in enumerate(pts):
+        nxt = pts[i + 1][1] if i + 1 < len(pts) else None
+        canonical = out / f"{code}_{label}.jpg"
+        candidates = [ss] + _nearby_times(ss, nxt, duration, used | {ss})
+        attempts = []
+        kept = None
+        for attempt_i, t in enumerate(candidates[: 1 + PRECHECK_RETRIES]):
+            dest = canonical if attempt_i == 0 else out / f"{code}_{label}_r{attempt_i}.jpg"
+            extracted = False
+            if reuse and dest.is_file() and dest.stat().st_size > 500 and attempt_i == 0:
+                ext = {"ss": t, "ok": True, "degraded": False, "bytes": dest.stat().st_size, "error": "", "reused": True}
+                extracted = True
+            else:
+                ext = _extract_one(media, dest, t)
+                ext["reused"] = False
+                extracted = bool(ext.get("ok"))
+            used.add(t)
+            attempt = {"ss": t, "try": attempt_i, "extract_ok": extracted, "bytes": ext.get("bytes") or 0, "reused": ext.get("reused")}
+            if not extracted:
+                attempt["degraded"] = True
+                attempt["error"] = ext.get("error") or "extract fail"
+                attempts.append(attempt)
+                print(f"DEGRADE {label} @{t}s try={attempt_i} {ext.get('error') or 'fail'}，换附近时间点")
+                continue
+            if not precheck:
+                if dest != canonical:
+                    if canonical.exists():
+                        canonical.unlink()
+                    dest.replace(canonical)
+                    dest = canonical
+                attempt["valid"] = None
+                attempts.append(attempt)
+                kept = {"label": label, "ss": t, "ok": True, "valid": None, "degraded": False, "bytes": dest.stat().st_size, "file": dest.name, "precheck": None, "attempts": attempts}
+                print(f"OK {label} @{t}s bytes={dest.stat().st_size}（未预检）")
+                break
+            pc = _precheck_image(llm, dest, code, label, t)
+            if pc.get("usage"):
+                usages.append(pc["usage"])
+            attempt["valid"] = pc["valid"]
+            attempt["reason"] = pc["reason"]
+            attempt["confidence"] = pc["confidence"]
+            attempts.append(attempt)
+            if pc["valid"]:
+                if dest != canonical:
+                    if canonical.exists():
+                        canonical.unlink()
+                    dest.replace(canonical)
+                    dest = canonical
+                kept = {
+                    "label": label,
+                    "ss": t,
+                    "ok": True,
+                    "valid": True,
+                    "degraded": False,
+                    "bytes": dest.stat().st_size,
+                    "file": dest.name,
+                    "precheck": pc,
+                    "attempts": attempts,
+                    "retries": attempt_i,
+                    "planned_ss": ss,
+                }
+                note = " 预检不确定，先留给终审" if pc.get("uncertain") else ""
+                print(f"VALID {label} @{t}s bytes={dest.stat().st_size} try={attempt_i} {pc.get('reason') or ''}{note}")
+                break
+            print(f"INVALID {label} @{t}s try={attempt_i} {pc.get('reason') or '无效帧'}，不送终审，重抽")
+            if dest.exists():
+                dest.unlink()
+        if kept:
+            shots.append(kept)
             ok += 1
+            if kept.get("valid") is not False:
+                valid_n += 1
         else:
-            print(f"DEGRADE {label} @{ss}s {_redact_media((fr.stderr or '')[-200:])}")
-            row["degraded"] = True
-            degraded.append(f"{label}@{ss}s fail")
-        shots.append(row)
+            reasons = [a.get("reason") or a.get("error") or "" for a in attempts]
+            discarded.append({"label": label, "planned_ss": ss, "attempts": attempts})
+            degraded.append(f"{label}@{ss}s discarded")
+            shots.append({
+                "label": label,
+                "ss": ss,
+                "ok": False,
+                "valid": False,
+                "degraded": True,
+                "bytes": 0,
+                "file": "",
+                "precheck": None,
+                "attempts": attempts,
+                "retries": max(0, len(attempts) - 1),
+                "planned_ss": ss,
+                "discarded": True,
+                "reason": "；".join(x for x in reasons if x)[:300],
+            })
+            print(f"DISCARD {label} 计划 @{ss}s，{len(attempts)} 次后仍无效或抽不到，丢弃该点")
+        if canonical.exists() and not (kept and kept.get("ok")):
+            canonical.unlink()
+    cost = _cost_of(usages, started) if usages else {"peak": _ds_peak(started), "deepseek_cny": 0.0, "luna_usd_est": 0.0}
     manifest = {
         "code": code,
         "strm": str(strm),
         "duration": duration,
         "rule": meta.get("rule"),
         "capped": bool(meta.get("capped")),
+        "precheck": precheck,
+        "precheck_model": (llm or {}).get("precheck_model") if precheck else "",
         "planned": [{"label": l, "ss": ss} for l, ss in pts],
         "shots": shots,
         "ok": ok,
+        "valid": valid_n,
         "planned_n": len(pts),
+        "discarded_n": len(discarded),
+        "discarded": discarded,
         "degraded": degraded,
+        "cost": cost,
+        "started_at": started.isoformat(),
+        "finished_at": datetime.now(TZ).isoformat(),
     }
-    (out / "frames_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"frames {ok}/{len(pts)} → {out}" + (f"  降级 {len(degraded)}" if degraded else ""))
-    # keep a copy of the manifest outside the temp dir so --cleanup still leaves timestamps
+    (out / "frames_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")
+    print(
+        f"frames 抽出 {ok}/{len(pts)} 有效 {valid_n}/{len(pts)} → {out}"
+        + (f"  丢弃 {len(discarded)}" if discarded else "")
+        + (f"  预检 DeepSeek ¥{cost['deepseek_cny']:.4f}" if precheck else "")
+    )
     keep = Path(f"/tmp/av-auto-frames/{code}_manifest.json")
     keep.parent.mkdir(parents=True, exist_ok=True)
-    keep.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    keep.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")
     if args.cleanup:
         for child in out.iterdir():
             if child.name != "frames_manifest.json":
@@ -668,7 +1093,98 @@ def cmd_frames(args) -> int:
                 elif child.is_dir():
                     shutil.rmtree(child, ignore_errors=True)
         print("已清理临时帧（保留 frames_manifest.json）")
-    return 0 if ok else 1
+    return 0 if (valid_n if precheck else ok) else 1
+
+
+def _load_manifest(out: Path, code: str) -> dict:
+    path = out / "frames_manifest.json"
+    if not path.is_file():
+        _die(f"找不到 {path}，请先跑 av_auto frames")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def cmd_review(args) -> int:
+    """Dual-model final review on valid frames only. Never sends invalid shots."""
+    paths = _paths()
+    code = _norm_code(args.code)
+    out = Path(args.out) if args.out else Path(f"/tmp/av-auto-frames/{code}")
+    if not args.out:
+        # prefer the same dir used by frames in this environment
+        alt = Path(f"/config/scripts/av-auto-fs/frames/{code}")
+        if not (out / "frames_manifest.json").is_file() and (alt / "frames_manifest.json").is_file():
+            out = alt
+    manifest = _load_manifest(out, code)
+    if not manifest.get("precheck"):
+        _die("清单未经有效性预检。请先跑 av_auto frames（默认会预检），不要把未预检帧送进终审。")
+    shots = [s for s in (manifest.get("shots") or []) if s.get("ok") and s.get("valid") is True and s.get("file")]
+    files = []
+    for s in shots:
+        pth = out / s["file"]
+        if pth.is_file() and pth.stat().st_size > 500:
+            files.append((s, pth))
+    if not files:
+        _die(f"{code} 没有可送终审的有效帧（无效帧已丢弃）")
+    llm = _load_llm_runtime()
+    images = [p for _, p in files]
+    captions = "、".join(f"{s['label']}@{s['ss']}s" for s, _ in files)
+    user = f"番号 {code}。本请求只附有效抽帧（均为本地缩图的 data URI，不是网址）：{captions}。请综合这些有效帧给出 JSON 判断。"
+    started = datetime.now(TZ)
+    models = {}
+    usages = []
+    print(f"review {code}: {len(files)} 有效帧 → {', '.join(llm['review_models'])}；无效帧不送")
+    for model in llm["review_models"]:
+        rec = _chat_retry(llm, model, images, REVIEW_SYSTEM, user, REVIEW_TO, 800)
+        parsed = rec.get("parsed") or {}
+        verdict = parsed.get("verdict") if parsed.get("verdict") in ("pass", "fail", "uncertain") else "uncertain"
+        if rec.get("usage"):
+            usages.append(rec["usage"])
+        models[model] = {
+            "ok": bool(rec.get("ok") and parsed),
+            "verdict": verdict,
+            "hits": parsed.get("hits") or [],
+            "reason": parsed.get("reason") or rec.get("error") or "",
+            "confidence": parsed.get("confidence") or "",
+            "elapsed_s": rec.get("elapsed_s"),
+            "http": rec.get("http"),
+            "attempts": rec.get("attempts") or 1,
+            "usage": rec.get("usage") or {},
+        }
+        print(f"  {model}: {verdict} {models[model]['reason']}".rstrip())
+    vs = [models[m]["verdict"] for m in llm["review_models"]]
+    if vs and all(v == vs[0] for v in vs):
+        agreement = "agree"
+        consensus = vs[0]
+    elif "fail" in vs and "pass" in vs:
+        agreement = "disagree"
+        consensus = "uncertain"
+    else:
+        agreement = "partial"
+        consensus = "uncertain" if "uncertain" in vs else vs[0]
+    cost = _cost_of(usages, started)
+    result = {
+        "code": code,
+        "frames_dir": str(out),
+        "valid_frames": [{"label": s["label"], "ss": s["ss"], "file": s["file"]} for s, _ in files],
+        "valid_n": len(files),
+        "models": models,
+        "agreement": agreement,
+        "consensus": consensus,
+        "cost": cost,
+        "started_at": started.isoformat(),
+        "finished_at": datetime.now(TZ).isoformat(),
+        "note": "invalid frames were not sent",
+    }
+    dest = out / "review.json"
+    dest.write_text(json.dumps(result, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")
+    print(f"review {code}: {agreement}/{consensus}  DeepSeek ¥{cost['deepseek_cny']:.4f}  luna 约 ${cost['luna_usd_est']:.4f} → {dest}")
+    if args.cleanup:
+        for child in out.iterdir():
+            if child.name in {"frames_manifest.json", "review.json"}:
+                continue
+            if child.is_file() and child.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
+                child.unlink()
+        print("已清理临时帧（保留 frames_manifest.json 与 review.json）")
+    return 0
 
 
 def _emby_refresh(paths: dict, dest: Path) -> str:
@@ -1019,8 +1535,14 @@ def cmd_intake(args) -> int:
         return rc
     if getattr(args, "frames", False):
         out = getattr(args, "out", "") or ""
-        cleanup = bool(getattr(args, "cleanup", True))
-        rc = cmd_frames(argparse.Namespace(code=args.code, strm="", out=out, cleanup=cleanup))
+        cleanup = bool(getattr(args, "cleanup", False))
+        rc = cmd_frames(argparse.Namespace(
+            code=args.code, strm="", out=out, cleanup=cleanup,
+            no_precheck=bool(getattr(args, "no_precheck", False)),
+            no_reuse=False,
+        ))
+        if rc == 0 and getattr(args, "review", False):
+            rc = cmd_review(argparse.Namespace(code=args.code, out=out, cleanup=cleanup))
     print(f"INTAKE { _norm_code(args.code) }: 完成（未 promote，未刮削）")
     return rc
 
@@ -1056,19 +1578,29 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("codes", nargs="+")
     s.set_defaults(func=cmd_strm)
 
-    s = sub.add_parser("frames", help="对正片 strm 加密抽帧：2分钟起每约8分钟一帧，再补约85%，最多8帧")
+    s = sub.add_parser("frames", help="对正片 strm 加密抽帧：2分钟起每约8分钟一帧，再补约85%，最多8帧有效帧；默认预检无效则重抽")
     s.add_argument("code", nargs="?", default="")
     s.add_argument("--strm", default="", help="直接指定 strm 路径")
     s.add_argument("--out", default="", help="帧输出目录，默认 /tmp/av-auto-frames/<番号>")
     s.add_argument("--cleanup", action="store_true", help="抽完删除临时帧（保留时间点清单）")
+    s.add_argument("--no-precheck", action="store_true", help="跳过有效性预检（官方库只读对时点时用；验证条不要加这个）")
+    s.add_argument("--no-reuse", action="store_true", help="不复用已有 jpg，全部重抽")
     s.set_defaults(func=cmd_frames)
+
+    s = sub.add_parser("review", help="仅对有效帧做 DeepSeek-flash + gpt-6-luna 终审；无效帧不送")
+    s.add_argument("code")
+    s.add_argument("--out", default="", help="帧目录，默认已有的 av-auto-fs/frames/<番号> 或 /tmp/av-auto-frames/<番号>")
+    s.add_argument("--cleanup", action="store_true", help="审完删除临时帧（保留清单和 review.json）")
+    s.set_defaults(func=cmd_review)
 
     s = sub.add_parser("intake", help="submit→wait→clean→strm；可选抽帧。不刮削、不 promote")
     s.add_argument("--code", required=True)
     s.add_argument("--url", required=True)
     s.add_argument("--timeout", type=int, default=0)
     s.add_argument("--frames", action="store_true")
+    s.add_argument("--review", action="store_true", help="抽帧预检后再做双模型终审；仍不 promote")
     s.add_argument("--cleanup", action="store_true")
+    s.add_argument("--no-precheck", action="store_true")
     s.add_argument("--out", default="")
     s.set_defaults(func=cmd_intake)
 
