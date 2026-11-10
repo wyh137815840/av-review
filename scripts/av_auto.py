@@ -28,6 +28,11 @@ from pathlib import Path
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+from fmp4_http import Fmp4RangeError, open_fmp4_session
+
 PLUGIN_DIR = Path("/config/plugins/av115scraper")
 USER_DB = Path(os.environ.get("MP_USER_DB", "/config/user.db"))
 STAGING_115_DEFAULT = "/av-auto"
@@ -814,33 +819,23 @@ def _nearby_times(ss: int, nxt: int | None, duration: float, used: set[int]) -> 
     return out[:PRECHECK_RETRIES]
 
 
-def _extract_one(media: str, dest: Path, ss: int) -> dict:
+def _is_partial_file_error(text: str) -> bool:
+    return "partial file" in (text or "").lower()
+
+
+def _ffmpeg_one_frame(media: str, dest: Path, ss: float, *, output_seek: bool = False) -> dict:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
         dest.unlink()
     row = {"ss": ss, "ok": False, "degraded": False, "bytes": 0, "error": ""}
+    seek = ["-ss", f"{float(ss):.3f}"]
+    if output_seek:
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", media, *seek]
+    else:
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *seek, "-i", media]
+    cmd += ["-frames:v", "1", "-q:v", "2", "-vf", "scale=w='min(800,iw)':h=-2", str(dest)]
     try:
-        fr = _run_ff(
-            [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-ss",
-                str(ss),
-                "-i",
-                media,
-                "-frames:v",
-                "1",
-                "-q:v",
-                "2",
-                "-vf",
-                "scale=w='min(800,iw)':h=-2",
-                str(dest),
-            ],
-            FRAME_TO,
-        )
+        fr = _run_ff(cmd, FRAME_TO)
     except subprocess.TimeoutExpired:
         row["degraded"] = True
         row["error"] = f"seek timeout {FRAME_TO}s"
@@ -853,6 +848,88 @@ def _extract_one(media: str, dest: Path, ss: int) -> dict:
     row["error"] = _redact_media((fr.stderr or "")[-200:]) or f"ffmpeg rc={fr.returncode}"
     if dest.exists():
         dest.unlink()
+    return row
+
+
+def _snippet_seek(path: Path, ss: float, frag_t0: float) -> float:
+    """Zero-based offset into a local init+fragment file.
+
+    The snippet's ffprobe start_time is often the absolute movie time of the
+    moof. Seeking to that absolute time (start_time + offset) makes ffmpeg
+    drop every frame and exit 0 with an empty jpeg. Seeking to the offset
+    within the fragment, counting from 0, lands on the right picture.
+    """
+    local = max(0.0, float(ss) - float(frag_t0))
+    try:
+        probed = _run_ff(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "json",
+                str(path),
+            ],
+            PROBE_TO,
+        )
+        info = json.loads(probed.stdout or "{}")
+        dur = float((info.get("format") or {}).get("duration") or 0)
+    except (subprocess.TimeoutExpired, ValueError, TypeError):
+        dur = 0.0
+    # A one-GOP snippet is short. Don't clamp against a duration that is
+    # really the absolute end timestamp of a fragment that started later.
+    if 0.05 < dur <= 2.0 and local >= dur:
+        local = max(0.0, dur - 0.05)
+    return local
+
+
+def _extract_fmp4_frame(session, dest: Path, ss: float) -> dict:
+    """Extract one frame from a fragmented HTTP MP4 without reading the whole object."""
+    snip = dest.with_name(dest.stem + ".snip.mp4")
+    try:
+        try:
+            blob, t0 = session.snippet_for(ss)
+        except Fmp4RangeError as exc:
+            return {"ss": ss, "ok": False, "degraded": True, "bytes": 0, "error": str(exc)[:300], "via": "fmp4-range"}
+        snip.write_bytes(blob)
+        seek = _snippet_seek(snip, float(ss), t0)
+        got = _ffmpeg_one_frame(str(snip), dest, seek)
+        if not got["ok"]:
+            got = _ffmpeg_one_frame(str(snip), dest, seek, output_seek=True)
+        if not got["ok"] and seek != 0:
+            got = _ffmpeg_one_frame(str(snip), dest, 0)
+        got["via"] = "fmp4-range"
+        return got
+    finally:
+        if snip.exists():
+            snip.unlink()
+
+
+def _extract_one(media: str, dest: Path, ss: int, session=None) -> dict:
+    if session is not None:
+        return _extract_fmp4_frame(session, dest, ss)
+    row = _ffmpeg_one_frame(media, dest, ss)
+    if row["ok"] or not _is_partial_file_error(row.get("error") or ""):
+        return row
+    if not str(media).startswith(("http://", "https://")):
+        return row
+    # Direct HTTP seek reported a partial file. Retry once via closed ranges.
+    try:
+        fallback = open_fmp4_session(media)
+    except Fmp4RangeError as exc:
+        row["error"] = (row.get("error") or "")[:180] + " | " + str(exc)[:120]
+        return row
+    if fallback is None:
+        return row
+    try:
+        retry = _extract_fmp4_frame(fallback, dest, ss)
+    finally:
+        fallback.close()
+    if retry.get("ok"):
+        return retry
+    row["error"] = ((row.get("error") or "") + " | " + (retry.get("error") or ""))[:300]
     return row
 
 
@@ -912,188 +989,225 @@ def cmd_frames(args) -> int:
         print(f"cdn host (1 hop): {_host_only(hop)}")
     except Exception as exc:
         print(f"cdn hop 探测失败（ffmpeg 会自行跟随 redirect）: {_redact_media(str(exc))}")
-    # 手动打开 CDN 链会 403（缺跳转 cookie）；把 Av115 redirect 交给 ffmpeg 自己跟 1 跳。
+    # 手动打开 CDN 链会 403（缺跳转 cookie）。渐进式 MP4 仍把 Av115 redirect 交给 ffmpeg
+    # 自己跟 1 跳。fragmented MP4 则自己跟跳并保住 cookie，只用闭合 Range 取目标分片。
     media = src
     probe = out / "probe.json"
+    session = None
+    access = "direct"
+    if media.startswith(("http://", "https://")):
+        try:
+            session = open_fmp4_session(media)
+        except Fmp4RangeError as exc:
+            print(f"fragmented mp4 Range 索引失败，退回 ffmpeg 直连: {exc}")
+            session = None
     try:
-        r = _run_ff(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration,format_name",
-                "-show_entries",
-                "stream=codec_name,codec_type,width,height",
-                "-of",
-                "json",
-                media,
-            ],
-            PROBE_TO,
-        )
-    except subprocess.TimeoutExpired:
-        _die(f"ffprobe 超时 {PROBE_TO}s")
-    if r.returncode != 0:
-        _die(f"ffprobe 失败: {_redact_media((r.stderr or '')[-300:])}")
-    probe.write_text(r.stdout or "{}", encoding="utf-8")
-    try:
-        info = json.loads(r.stdout or "{}")
-        duration = float((info.get("format") or {}).get("duration") or 0)
-    except Exception:
-        duration = 0
-    print(f"duration: {duration:.1f}s" if duration else "duration: unknown")
-    pts, meta = seek_points(duration)
-    if not pts:
-        print("WARN: 片长不足，无法按加密规则抽帧")
-        if args.cleanup:
-            shutil.rmtree(out, ignore_errors=True)
-        return 1
-    labels = ", ".join(f"{l}@{ss}s" for l, ss in pts)
-    cap_note = " 触顶8帧" if meta.get("capped") else ""
-    print(f"seek: {labels}{cap_note}")
-    if precheck:
-        print(f"precheck: {llm['precheck_model']} 一家；无效则在该点附近重抽，单点最多 {PRECHECK_RETRIES} 次")
-    ok = 0
-    valid_n = 0
-    discarded = []
-    degraded = []
-    shots = []
-    usages = []
-    used: set[int] = set()
-    started = datetime.now(TZ)
-    for i, (label, ss) in enumerate(pts):
-        nxt = pts[i + 1][1] if i + 1 < len(pts) else None
-        canonical = out / f"{code}_{label}.jpg"
-        candidates = [ss] + _nearby_times(ss, nxt, duration, used | {ss})
-        attempts = []
-        kept = None
-        for attempt_i, t in enumerate(candidates[: 1 + PRECHECK_RETRIES]):
-            dest = canonical if attempt_i == 0 else out / f"{code}_{label}_r{attempt_i}.jpg"
-            extracted = False
-            if reuse and dest.is_file() and dest.stat().st_size > 500 and attempt_i == 0:
-                ext = {"ss": t, "ok": True, "degraded": False, "bytes": dest.stat().st_size, "error": "", "reused": True}
-                extracted = True
-            else:
-                ext = _extract_one(media, dest, t)
-                ext["reused"] = False
-                extracted = bool(ext.get("ok"))
-            used.add(t)
-            attempt = {"ss": t, "try": attempt_i, "extract_ok": extracted, "bytes": ext.get("bytes") or 0, "reused": ext.get("reused")}
-            if not extracted:
-                attempt["degraded"] = True
-                attempt["error"] = ext.get("error") or "extract fail"
-                attempts.append(attempt)
-                print(f"DEGRADE {label} @{t}s try={attempt_i} {ext.get('error') or 'fail'}，换附近时间点")
-                continue
-            if not precheck:
-                if dest != canonical:
-                    if canonical.exists():
-                        canonical.unlink()
-                    dest.replace(canonical)
-                    dest = canonical
-                attempt["valid"] = None
-                attempts.append(attempt)
-                kept = {"label": label, "ss": t, "ok": True, "valid": None, "degraded": False, "bytes": dest.stat().st_size, "file": dest.name, "precheck": None, "attempts": attempts}
-                print(f"OK {label} @{t}s bytes={dest.stat().st_size}（未预检）")
-                break
-            pc = _precheck_image(llm, dest, code, label, t)
-            if pc.get("usage"):
-                usages.append(pc["usage"])
-            attempt["valid"] = pc["valid"]
-            attempt["reason"] = pc["reason"]
-            attempt["confidence"] = pc["confidence"]
-            attempts.append(attempt)
-            if pc["valid"]:
-                if dest != canonical:
-                    if canonical.exists():
-                        canonical.unlink()
-                    dest.replace(canonical)
-                    dest = canonical
-                kept = {
-                    "label": label,
-                    "ss": t,
-                    "ok": True,
-                    "valid": True,
-                    "degraded": False,
-                    "bytes": dest.stat().st_size,
-                    "file": dest.name,
-                    "precheck": pc,
-                    "attempts": attempts,
-                    "retries": attempt_i,
-                    "planned_ss": ss,
-                }
-                note = " 预检不确定，先留给终审" if pc.get("uncertain") else ""
-                print(f"VALID {label} @{t}s bytes={dest.stat().st_size} try={attempt_i} {pc.get('reason') or ''}{note}")
-                break
-            print(f"INVALID {label} @{t}s try={attempt_i} {pc.get('reason') or '无效帧'}，不送终审，重抽")
-            if dest.exists():
-                dest.unlink()
-        if kept:
-            shots.append(kept)
-            ok += 1
-            if kept.get("valid") is not False:
-                valid_n += 1
+        if session is not None:
+            access = "fmp4-range:" + session.index.source
+            duration = float(session.index.duration or 0)
+            probe_doc = {
+                "format": {
+                    "duration": f"{duration:.6f}",
+                    "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+                    "size": str(session.remote.size),
+                },
+                "streams": session.index.streams,
+                "fragmented": True,
+                "index": session.index.source,
+            }
+            probe.write_text(json.dumps(probe_doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            print(
+                f"fragmented mp4: {session.index.source} 索引，duration {duration:.1f}s，"
+                f"大小 {session.remote.size} 字节；闭合 Range 取 moof/mdat，不整文件下载"
+            )
         else:
-            reasons = [a.get("reason") or a.get("error") or "" for a in attempts]
-            discarded.append({"label": label, "planned_ss": ss, "attempts": attempts})
-            degraded.append(f"{label}@{ss}s discarded")
-            shots.append({
-                "label": label,
-                "ss": ss,
-                "ok": False,
-                "valid": False,
-                "degraded": True,
-                "bytes": 0,
-                "file": "",
-                "precheck": None,
-                "attempts": attempts,
-                "retries": max(0, len(attempts) - 1),
-                "planned_ss": ss,
-                "discarded": True,
-                "reason": "；".join(x for x in reasons if x)[:300],
-            })
-            print(f"DISCARD {label} 计划 @{ss}s，{len(attempts)} 次后仍无效或抽不到，丢弃该点")
-        if canonical.exists() and not (kept and kept.get("ok")):
-            canonical.unlink()
-    cost = _cost_of(usages, started) if usages else {"peak": _ds_peak(started), "deepseek_cny": 0.0, "luna_usd_est": 0.0}
-    manifest = {
-        "code": code,
-        "strm": str(strm),
-        "duration": duration,
-        "rule": meta.get("rule"),
-        "capped": bool(meta.get("capped")),
-        "precheck": precheck,
-        "precheck_model": (llm or {}).get("precheck_model") if precheck else "",
-        "planned": [{"label": l, "ss": ss} for l, ss in pts],
-        "shots": shots,
-        "ok": ok,
-        "valid": valid_n,
-        "planned_n": len(pts),
-        "discarded_n": len(discarded),
-        "discarded": discarded,
-        "degraded": degraded,
-        "cost": cost,
-        "started_at": started.isoformat(),
-        "finished_at": datetime.now(TZ).isoformat(),
-    }
-    (out / "frames_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")
-    print(
-        f"frames 抽出 {ok}/{len(pts)} 有效 {valid_n}/{len(pts)} → {out}"
-        + (f"  丢弃 {len(discarded)}" if discarded else "")
-        + (f"  预检 DeepSeek ¥{cost['deepseek_cny']:.4f}" if precheck else "")
-    )
-    keep = Path(f"/tmp/av-auto-frames/{code}_manifest.json")
-    keep.parent.mkdir(parents=True, exist_ok=True)
-    keep.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")
-    if args.cleanup:
-        for child in out.iterdir():
-            if child.name != "frames_manifest.json":
-                if child.is_file():
-                    child.unlink()
-                elif child.is_dir():
-                    shutil.rmtree(child, ignore_errors=True)
-        print("已清理临时帧（保留 frames_manifest.json）")
-    return 0 if (valid_n if precheck else ok) else 1
+            try:
+                r = _run_ff(
+                    [
+                        "ffprobe",
+                        "-v",
+                        "error",
+                        "-show_entries",
+                        "format=duration,format_name",
+                        "-show_entries",
+                        "stream=codec_name,codec_type,width,height",
+                        "-of",
+                        "json",
+                        media,
+                    ],
+                    PROBE_TO,
+                )
+            except subprocess.TimeoutExpired:
+                _die(f"ffprobe 超时 {PROBE_TO}s")
+            if r.returncode != 0:
+                _die(f"ffprobe 失败: {_redact_media((r.stderr or '')[-300:])}")
+            probe.write_text(r.stdout or "{}", encoding="utf-8")
+            try:
+                info = json.loads(r.stdout or "{}")
+                duration = float((info.get("format") or {}).get("duration") or 0)
+            except Exception:
+                duration = 0
+            print(f"duration: {duration:.1f}s" if duration else "duration: unknown")
+        pts, meta = seek_points(duration)
+        if not pts:
+            print("WARN: 片长不足，无法按加密规则抽帧")
+            if args.cleanup:
+                shutil.rmtree(out, ignore_errors=True)
+            return 1
+        labels = ", ".join(f"{l}@{ss}s" for l, ss in pts)
+        cap_note = " 触顶8帧" if meta.get("capped") else ""
+        print(f"seek: {labels}{cap_note}")
+        if precheck:
+            print(f"precheck: {llm['precheck_model']} 一家；无效则在该点附近重抽，单点最多 {PRECHECK_RETRIES} 次")
+        ok = 0
+        valid_n = 0
+        discarded = []
+        degraded = []
+        shots = []
+        usages = []
+        used: set[int] = set()
+        started = datetime.now(TZ)
+        for i, (label, ss) in enumerate(pts):
+            nxt = pts[i + 1][1] if i + 1 < len(pts) else None
+            canonical = out / f"{code}_{label}.jpg"
+            candidates = [ss] + _nearby_times(ss, nxt, duration, used | {ss})
+            attempts = []
+            kept = None
+            for attempt_i, t in enumerate(candidates[: 1 + PRECHECK_RETRIES]):
+                dest = canonical if attempt_i == 0 else out / f"{code}_{label}_r{attempt_i}.jpg"
+                extracted = False
+                if reuse and dest.is_file() and dest.stat().st_size > 500 and attempt_i == 0:
+                    ext = {"ss": t, "ok": True, "degraded": False, "bytes": dest.stat().st_size, "error": "", "reused": True}
+                    extracted = True
+                else:
+                    ext = _extract_one(media, dest, t, session=session)
+                    ext["reused"] = False
+                    extracted = bool(ext.get("ok"))
+                used.add(t)
+                attempt = {"ss": t, "try": attempt_i, "extract_ok": extracted, "bytes": ext.get("bytes") or 0, "reused": ext.get("reused")}
+                if not extracted:
+                    attempt["degraded"] = True
+                    attempt["error"] = ext.get("error") or "extract fail"
+                    attempts.append(attempt)
+                    print(f"DEGRADE {label} @{t}s try={attempt_i} {ext.get('error') or 'fail'}，换附近时间点")
+                    continue
+                if not precheck:
+                    if dest != canonical:
+                        if canonical.exists():
+                            canonical.unlink()
+                        dest.replace(canonical)
+                        dest = canonical
+                    attempt["valid"] = None
+                    attempts.append(attempt)
+                    kept = {"label": label, "ss": t, "ok": True, "valid": None, "degraded": False, "bytes": dest.stat().st_size, "file": dest.name, "precheck": None, "attempts": attempts}
+                    print(f"OK {label} @{t}s bytes={dest.stat().st_size}（未预检）")
+                    break
+                pc = _precheck_image(llm, dest, code, label, t)
+                if pc.get("usage"):
+                    usages.append(pc["usage"])
+                attempt["valid"] = pc["valid"]
+                attempt["reason"] = pc["reason"]
+                attempt["confidence"] = pc["confidence"]
+                attempts.append(attempt)
+                if pc["valid"]:
+                    if dest != canonical:
+                        if canonical.exists():
+                            canonical.unlink()
+                        dest.replace(canonical)
+                        dest = canonical
+                    kept = {
+                        "label": label,
+                        "ss": t,
+                        "ok": True,
+                        "valid": True,
+                        "degraded": False,
+                        "bytes": dest.stat().st_size,
+                        "file": dest.name,
+                        "precheck": pc,
+                        "attempts": attempts,
+                        "retries": attempt_i,
+                        "planned_ss": ss,
+                    }
+                    note = " 预检不确定，先留给终审" if pc.get("uncertain") else ""
+                    print(f"VALID {label} @{t}s bytes={dest.stat().st_size} try={attempt_i} {pc.get('reason') or ''}{note}")
+                    break
+                print(f"INVALID {label} @{t}s try={attempt_i} {pc.get('reason') or '无效帧'}，不送终审，重抽")
+                if dest.exists():
+                    dest.unlink()
+            if kept:
+                shots.append(kept)
+                ok += 1
+                if kept.get("valid") is not False:
+                    valid_n += 1
+            else:
+                reasons = [a.get("reason") or a.get("error") or "" for a in attempts]
+                discarded.append({"label": label, "planned_ss": ss, "attempts": attempts})
+                degraded.append(f"{label}@{ss}s discarded")
+                shots.append({
+                    "label": label,
+                    "ss": ss,
+                    "ok": False,
+                    "valid": False,
+                    "degraded": True,
+                    "bytes": 0,
+                    "file": "",
+                    "precheck": None,
+                    "attempts": attempts,
+                    "retries": max(0, len(attempts) - 1),
+                    "planned_ss": ss,
+                    "discarded": True,
+                    "reason": "；".join(x for x in reasons if x)[:300],
+                })
+                print(f"DISCARD {label} 计划 @{ss}s，{len(attempts)} 次后仍无效或抽不到，丢弃该点")
+            if canonical.exists() and not (kept and kept.get("ok")):
+                canonical.unlink()
+        cost = _cost_of(usages, started) if usages else {"peak": _ds_peak(started), "deepseek_cny": 0.0, "luna_usd_est": 0.0}
+        manifest = {
+            "code": code,
+            "strm": str(strm),
+            "duration": duration,
+            "rule": meta.get("rule"),
+            "capped": bool(meta.get("capped")),
+            "precheck": precheck,
+            "precheck_model": (llm or {}).get("precheck_model") if precheck else "",
+            "planned": [{"label": l, "ss": ss} for l, ss in pts],
+            "shots": shots,
+            "ok": ok,
+            "valid": valid_n,
+            "planned_n": len(pts),
+            "discarded_n": len(discarded),
+            "discarded": discarded,
+            "degraded": degraded,
+            "cost": cost,
+            "media_access": access,
+            "range_bytes": int(session.remote.fetched) if session is not None else 0,
+            "started_at": started.isoformat(),
+            "finished_at": datetime.now(TZ).isoformat(),
+        }
+        (out / "frames_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")
+        print(
+            f"frames 抽出 {ok}/{len(pts)} 有效 {valid_n}/{len(pts)} → {out}"
+            + (f"  丢弃 {len(discarded)}" if discarded else "")
+            + (f"  预检 DeepSeek ¥{cost['deepseek_cny']:.4f}" if precheck else "")
+        )
+        keep = Path(f"/tmp/av-auto-frames/{code}_manifest.json")
+        keep.parent.mkdir(parents=True, exist_ok=True)
+        keep.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")
+        if args.cleanup:
+            for child in out.iterdir():
+                if child.name != "frames_manifest.json":
+                    if child.is_file():
+                        child.unlink()
+                    elif child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
+            print("已清理临时帧（保留 frames_manifest.json）")
+        return 0 if (valid_n if precheck else ok) else 1
+    finally:
+        if session is not None:
+            fetched = int(session.remote.fetched)
+            session.close()
+            print(f"range 实际读取 {fetched} 字节（未整文件下载）")
+
 
 
 def _load_manifest(out: Path, code: str) -> dict:

@@ -32,6 +32,6 @@ av_auto promote [--dry-run] <番号...>          # 显式搬家；验证条不�
 
 清杂质：只保留 ≥ min_size_mb（默认 300）的正片大视频（UC/AI/4K 等正片变体可留）；广告包、apk、宣传图、过小 sample/预告/trailer、文件名带广告/推广、嵌套垃圾夹全删。inbox 里若没有达标正片则不搬不删，便于排查。
 
-抽帧：从 2 分钟起约每 8 分钟一帧，再补约 85%（避开片尾），单部最多 8 帧有效帧；某一处 seek 过慢则降级跳过，不堵整批。默认用 DeepSeek-flash 一家做有效性预检：完全没人或完全不色（空景/字幕/胡聊等）判无效，在该点附近换时间重抽，单点最多再试 3 次，仍无效则丢弃该点，不送双模型终审。看不清或预检调用失败先当作有效交给终审，避免误杀。`--cleanup` 删临时帧，保留时间点清单。终审仍是 DeepSeek-flash + gpt-6-luna，不上 MiniMax/Grok，不改 media_llm_route。Magpie Key 由入口脚本临时放入运行时文件，用完删除，不入库。
+抽帧：从 2 分钟起约每 8 分钟一帧，再补约 85%（避开片尾），单部最多 8 帧有效帧；某一处 seek 过慢则降级跳过，不堵整批。HTTP(S) 上的 fragmented MP4（ftyp + 很小的 moov/mvex + 一串 moof/mdat）不再把 URL 直接交给 `ffmpeg -ss`。那条路径会发不闭合的 `Range: bytes=offset-`，并按渐进式整段 moov 去 seek，源上会报 `partial file`、一个包都写不出；只用闭合 Range 把开头约 2MB 下到本地却能解出帧。`av_auto.py` 与同目录的 `fmp4_http.py` 改成闭合 Range：跟随 redirect 并保住 cookie，用 sidx 或文件尾 mfra（都没有就只读 moof 头、跳过 mdat）定位时间点，只取对应 moof/mdat；分片过大或 sample 偏移是绝对文件位置时，只取该 GOP 的 sample 再在本地拼一个小片段。不整文件下载。默认用 DeepSeek-flash 一家做有效性预检：完全没人或完全不色（空景/字幕/胡聊等）判无效，在该点附近换时间重抽，单点最多再试 3 次，仍无效则丢弃该点，不送双模型终审。看不清或预检调用失败先当作有效交给终审，避免误杀。`--cleanup` 删临时帧，保留时间点清单。终审仍是 DeepSeek-flash + gpt-6-luna，不上 MiniMax/Grok，不改 media_llm_route。Magpie Key 由入口脚本临时放入运行时文件，用完删除，不入库。
 
 约束：用 p115client，不用 CloudDrive2；不改 media_llm_route；不刮削。验证条不要自动 promote。
