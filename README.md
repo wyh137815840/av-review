@@ -92,3 +92,4 @@ systemd 用户服务：`av-review-api.service`（linger 已开的话开机自启
 - 不要改 `media_llm_route.json`（期望 mtime 2026-11-10 09:05:53 +0800）。
 - 不要手改 MoviePilot 插件源码。
 - `av_auto review` 仍然只跑 DeepSeek-flash + gpt-6-luna。双模型 uncertain 或分歧时，用单独的 `av_auto grok-review`（见 `bin/av_auto.README.md`），写同目录 `grok_review.json`，不覆盖 `review.json`，也不要把 Grok 放进默认 review。
+- 115 离线已经进 `/av-auto/_staging/` 之后，用 `av_auto process <番号...>` 跑 clean → strm → frames → 双模型终审 → 仅未决时 grok-review。不要把番号写在子命令前面。见 `bin/av_auto.README.md`。

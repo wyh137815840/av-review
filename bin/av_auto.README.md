@@ -27,8 +27,31 @@ av_auto frames --strm /path/file.strm --cleanup
 av_auto frames --no-precheck                   # 只抽不预检（官方库对时点时用）
 av_auto review <番号>                          # 仅有效帧双模型终审（DeepSeek-flash + gpt-6-luna）
 av_auto grok-review <番号> --frames-dir <帧目录>  # 仅 uncertain / 分歧时的 Grok 复审
+av_auto process <番号...>                      # 离线已完成后的官方后处理，见下文
 av_auto intake --code 番号 --url URI [--frames --review --cleanup]  # 不 promote
 av_auto promote [--dry-run] <番号...>          # 显式搬家；验证条不要自动调用
+```
+
+## 离线完成后：`process`
+
+115 离线已经落到 `/av-auto/_staging/<番号>/` 之后，只用这一条。命令在前，番号在后。可以一次带多个番号。不重新交磁，不刮削，不搬进 `/AV`。
+
+```bash
+av_auto process ABP-073
+av_auto process ABP-073 ABP-108 ABP-246 ABP-313 ABP-383
+```
+
+`av_auto process --help` 也印出上面这条命令。
+
+顺序固定为 clean → strm → frames → review → grok-review。清杂质规则与单独的 `clean` 相同（只留大体积正片，UC/AI/4K 变体可留，广告/apk/宣传/过小 sample 删掉）。抽帧仍是约 2 分钟起、每约 8 分钟一帧、再补约 85%，最多 8 帧，并且默认做有效性预检；没人或完全不色的帧会重抽，仍无效则丢弃，不送终审。终审仍是 DeepSeek-flash + gpt-6-luna。只有 uncertain 或两家分歧才调用 `grok-review`，写同目录 `grok_review.json`，不覆盖 `review.json`。
+
+已经做过的步骤会跳过：正片已在 `/av-auto/<番号>/`（inbox 夹若还在，只补清残留，不当成失败）、staging strm 已在、预检有效帧已在、双模型 `review.json` 已在、以及未决时对应的 `grok_review.json` 已在。不会因为重跑而再次交离线。
+
+番号不能当子命令。下面这种写法会立刻失败，并提示正确的 `av_auto process ...`，不会把番号当成 cmd：
+
+```bash
+av_auto ABP-073 clean
+av_auto ABP-073 process
 ```
 
 清杂质：只保留 ≥ min_size_mb（默认 300）的正片大视频（UC/AI/4K 等正片变体可留）；广告包、apk、宣传图、过小 sample/预告/trailer、文件名带广告/推广、嵌套垃圾夹全删。inbox 里若没有达标正片则不搬不删，便于排查。

@@ -9,6 +9,10 @@ Flow for intake: p115client submit into /av-auto/_staging/<code>/ → wait offli
 → write strm only for keepers → dense-frame from those strm.
 Promote is explicit and never automatic.
 
+After offline is already finished, `process` is the only end-to-end entry:
+clean → strm → frames → dual-model review → grok-review when uncertain or split.
+It does not submit, scrape, or promote. A catalog code is never a subcommand.
+
 Default final review stays DeepSeek-flash + gpt-6-luna. `grok-review` is a
 separate Magpie tiebreaker for uncertain or split results: it pins
 cursor/grok-4.7 for that call only, writes grok_review.json, and does not
@@ -74,6 +78,11 @@ _BLOCKED_FRAME_RE = re.compile(
 PRECHECK_TO = int(os.environ.get("AV_AUTO_PRECHECK_TIMEOUT", "90"))
 REVIEW_TO = int(os.environ.get("AV_AUTO_REVIEW_TIMEOUT", "180"))
 TZ = ZoneInfo("Asia/Shanghai")
+# A token in the command slot. Keep in sync with CATALOG_CODE_RE in bin/av_auto.
+CATALOG_CODE_RE = re.compile(
+    r"(?i)^(?:FC2(?:[-_]?PPV)?[-_]?\d{5,}|[A-Z]{2,10}-\d{2,5}|[0-9]{6}[-_]\d{2,3})(?:[-_][A-Z0-9]+)*$"
+)
+PROCESS_EXAMPLE = "av_auto process ABP-073 ABP-108 ABP-246 ABP-313 ABP-383"
 
 PRECHECK_SYSTEM = (
     "你是抽帧有效性预检器，不是终审。只根据这一张图判断。"
@@ -458,6 +467,47 @@ def cmd_strm(args) -> int:
 
 def _norm_code(c: str) -> str:
     return str(c or "").strip().upper()
+
+
+def looks_like_catalog_code(token: str) -> bool:
+    """True when token is a catalog code, so it must not be parsed as a subcommand."""
+    return bool(CATALOG_CODE_RE.fullmatch(str(token or "").strip()))
+
+
+def _command_tokens(argv: list[str]) -> list[str]:
+    tokens = list(argv)
+    if tokens and tokens[0] == "--":
+        tokens = tokens[1:]
+    return tokens
+
+
+def code_as_command_message(argv: list[str]) -> str:
+    """Usage error when a catalog code was placed where the subcommand belongs."""
+    tokens = _command_tokens(argv)
+    codes: list[str] = []
+    for token in tokens:
+        if not looks_like_catalog_code(token):
+            break
+        codes.append(_norm_code(token))
+    if not codes:
+        return f"用法: av_auto process 番号 [番号...]  例如: {PROCESS_EXAMPLE}"
+    shown = " ".join(codes)
+    typed = " ".join(tokens)
+    return (
+        f"'{codes[0]}' 是番号，不是子命令。"
+        f"不要把番号放在子命令前面（av_auto {typed}）。"
+        f"115 离线完成后请用: av_auto process {shown}"
+        "（不交磁、不刮削、不 promote）"
+    )
+
+
+def reject_code_as_command(argv: list[str]) -> None:
+    """Refuse `av_auto ABP-073 clean` before argparse can treat the code as cmd."""
+    tokens = _command_tokens(argv)
+    if not tokens or tokens[0].startswith("-"):
+        return
+    if looks_like_catalog_code(tokens[0]):
+        _die(code_as_command_message(tokens), 2)
 
 
 def _read_strm_url(path: Path) -> str:
@@ -2004,19 +2054,24 @@ def cmd_clean(args) -> int:
         _die(f"无法创建 {dest}")
     items = _walk(pan, inbox_id)
     keepers = [r for r in items if not r["is_dir"] and _is_keeper(r["name"], r["size"], min_bytes)]
-    junk_files = [r for r in items if not r["is_dir"] and r not in keepers]
     junk_dirs = [r for r in items if r["is_dir"]]
     if not keepers:
-        print(f"FAIL {code}: inbox 里没有达标正片（>{paths['min_size_mb']}MB 且非预告/广告），不搬、不删 inbox，便于排查")
-        print(f"  files={len([r for r in items if not r['is_dir']])} dirs={len(junk_dirs)}")
-        return 1
-    moved = 0
-    for rec in keepers:
-        if rec["id"] and rec["id"] != dest_id:
-            pan.move(rec["id"], dest_id)
-            moved += 1
-            print(f"KEEP {code}: {rec['name']} size={rec['size']} → {dest}")
-    leftover = []
+        already = _videos_in(pan, dest_id, min_bytes)
+        if not already:
+            print(f"FAIL {code}: inbox 里没有达标正片（>{paths['min_size_mb']}MB 且非预告/广告），不搬、不删 inbox，便于排查")
+            print(f"  files={len([r for r in items if not r['is_dir']])} dirs={len(junk_dirs)}")
+            return 1
+        # Feature already lives in /av-auto/<code>/. A rerun must not fail just
+        # because the inbox folder is empty or only still holds junk.
+        print(f"SKIP clean {code}: inbox 已无达标正片，正片已在 {dest}")
+        moved = 0
+    else:
+        moved = 0
+        for rec in keepers:
+            if rec["id"] and rec["id"] != dest_id:
+                pan.move(rec["id"], dest_id)
+                moved += 1
+                print(f"KEEP {code}: {rec['name']} size={rec['size']} → {dest}")
     # re-walk inbox after moves
     left = _walk(pan, inbox_id)
     leftover_files = [r for r in left if not r["is_dir"]]
@@ -2032,13 +2087,11 @@ def cmd_clean(args) -> int:
         except Exception as exc:
             print(f"WARN {code}: 清空残留失败: {_redact_media(str(exc))}")
             return 1
-    # leave empty inbox/<code> folder (or try delete the code dir itself)
-    if deleted:
-        try:
-            client.fs_delete({"fid": str(inbox_id), "ignore_warn": 1})
-            print(f"CLEAN {code}: 已删空 inbox 夹 {inbox}")
-        except Exception:
-            print(f"CLEAN {code}: 残留已清，inbox 夹仍在")
+    try:
+        client.fs_delete({"fid": str(inbox_id), "ignore_warn": 1})
+        print(f"CLEAN {code}: 已删空 inbox 夹 {inbox}")
+    except Exception:
+        print(f"CLEAN {code}: 残留已清，inbox 夹仍在")
     print(f"OK {code}: 正片 {moved} 已进 {dest}，删除残留 {deleted}")
     return 0
 
@@ -2072,10 +2125,277 @@ def cmd_intake(args) -> int:
     return rc
 
 
+def _candidate_frames_dirs(code: str) -> list[Path]:
+    return [
+        Path(f"/tmp/av-auto-frames/{code}"),
+        Path(f"/config/scripts/av-auto-fs/frames/{code}"),
+    ]
+
+
+def _frames_ready(folder: Path) -> bool:
+    """True when prechecked valid frames are already on disk and can be reviewed."""
+    path = folder / "frames_manifest.json"
+    if not path.is_file():
+        return False
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(manifest, dict) or not manifest.get("precheck"):
+        return False
+    shots = [
+        shot for shot in (manifest.get("shots") or [])
+        if isinstance(shot, dict) and shot.get("ok") and shot.get("valid") is True and shot.get("file")
+    ]
+    if not shots:
+        return False
+    for shot in shots:
+        frame = folder / str(shot.get("file"))
+        try:
+            if not frame.is_file() or frame.stat().st_size <= 500:
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def _complete_review(folder: Path) -> dict | None:
+    """Dual-model review.json, or None when final review still has to run."""
+    path = folder / "review.json"
+    if not path.is_file():
+        return None
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(doc, dict):
+        return None
+    prior = prior_model_verdicts(doc)
+    if not set(REVIEW_MODELS).issubset(prior):
+        return None
+    return doc
+
+
+def _grok_already_done(folder: Path, trigger: str, code: str) -> bool:
+    path = folder / "grok_review.json"
+    if not path.is_file():
+        return False
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(doc, dict):
+        return False
+    recorded = _norm_code(str(doc.get("code") or ""))
+    if recorded and recorded != code:
+        return False
+    if str(doc.get("trigger") or "") != trigger:
+        return False
+    return doc.get("verdict") in _VERDICTS
+
+
+def _select_frames_dir(code: str) -> Path:
+    candidates = _candidate_frames_dirs(code)
+    for folder in candidates:
+        if _frames_ready(folder) or _complete_review(folder) is not None:
+            return folder
+    return candidates[0]
+
+
+def _offline_layout(code: str) -> dict:
+    """Read inbox/staging presence. Does not submit, delete, move, or promote."""
+    paths = _paths()
+    pan, _rest = _pan()
+    min_bytes = _min_bytes(paths)
+    inbox = f"{paths['staging_inbox'].rstrip('/')}/{code}"
+    dest = f"{paths['staging_115'].rstrip('/')}/{code}"
+    inbox_id = pan.dir_id(inbox)
+    dest_id = pan.dir_id(dest)
+    keepers = len(_videos_in(pan, dest_id, min_bytes)) if _id_ok(dest_id) else 0
+    return {
+        "inbox": _id_ok(inbox_id),
+        "dest": _id_ok(dest_id),
+        "dest_keepers": keepers,
+        "inbox_path": inbox,
+        "dest_path": dest,
+    }
+
+
+def _staging_strm_ready(code: str) -> bool:
+    paths = _paths()
+    name = code
+    try:
+        sys.path.insert(0, str(PLUGIN_DIR))
+        from av115_library import safe_name
+
+        name = safe_name(code) or code
+    except Exception:
+        name = code
+    folder = paths["staging_strm"] / name
+    if not folder.is_dir():
+        return False
+    for path in folder.glob("*.strm"):
+        try:
+            if path.is_file() and path.stat().st_size > 0:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _process_clean(code: str) -> int:
+    layout = _offline_layout(code)
+    if layout.get("inbox"):
+        print(f"clean {code}: inbox {layout.get('inbox_path')}")
+        return int(cmd_clean(argparse.Namespace(code=code)) or 0)
+    if int(layout.get("dest_keepers") or 0) > 0:
+        print(f"SKIP clean {code}: inbox 已空，正片已在 {layout.get('dest_path')}")
+        return 0
+    print(
+        f"FAIL {code}: /av-auto/_staging/{code} 与 /av-auto/{code} 都没有正片。"
+        "不交磁、不刮削、不 promote。",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def _process_strm(code: str) -> int:
+    if _staging_strm_ready(code):
+        print(f"SKIP strm {code}: staging strm 已存在")
+        return 0
+    return int(cmd_strm(argparse.Namespace(codes=[code])) or 0)
+
+
+def _process_frames(code: str, folder: Path) -> int:
+    if _frames_ready(folder):
+        print(f"SKIP frames {code}: 已有预检有效帧 → {folder}")
+        return 0
+    # Keep the frames. grok-review reads this directory and must not see a cleanup.
+    rc = int(cmd_frames(argparse.Namespace(
+        code=code,
+        strm="",
+        out=str(folder),
+        cleanup=False,
+        no_precheck=False,
+        no_reuse=False,
+    )) or 0)
+    if rc != 0:
+        return rc
+    if not _frames_ready(folder):
+        print(f"FAIL {code}: 抽帧未留下可送终审的预检有效帧", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _process_review(code: str, folder: Path) -> tuple[dict, int]:
+    existing = _complete_review(folder)
+    if existing is not None:
+        recorded = _norm_code(str(existing.get("code") or ""))
+        if not recorded or recorded == code:
+            print(
+                f"SKIP review {code}: 已有双模型 review.json"
+                f"（{existing.get('agreement')}/{existing.get('consensus')}）"
+            )
+            return existing, 0
+    rc = int(cmd_review(argparse.Namespace(code=code, out=str(folder), cleanup=False)) or 0)
+    if rc != 0:
+        return {}, rc
+    doc = _complete_review(folder)
+    if doc is None:
+        print(f"FAIL {code}: review 未写出双模型 review.json", file=sys.stderr)
+        return {}, 1
+    return doc, 0
+
+
+def _process_grok(code: str, folder: Path, review: dict) -> int:
+    trigger = tiebreak_trigger(review)
+    if not trigger:
+        print(
+            f"SKIP grok-review {code}: {review.get('agreement')}/{review.get('consensus')}"
+            " 两家已有明确结论，不调用 Grok"
+        )
+        return 0
+    if _grok_already_done(folder, trigger, code):
+        print(f"SKIP grok-review {code}: 已有 grok_review.json（trigger={trigger}），不重复调用")
+        return 0
+    return int(cmd_grok_review(argparse.Namespace(code=code, frames_dir=str(folder), out="")) or 0)
+
+
+def _process_offline_title(code: str) -> int:
+    """clean → strm → frames → review → grok only when still unresolved.
+
+    Never submits offline, scrapes, or promotes.
+    """
+    print(
+        f"PROCESS {code}: clean → strm → frames → review → grok-review（仅 uncertain / 分歧）；"
+        "不交磁、不刮削、不 promote"
+    )
+    rc = _process_clean(code)
+    if rc:
+        return rc
+    rc = _process_strm(code)
+    if rc:
+        return rc
+    folder = _select_frames_dir(code)
+    rc = _process_frames(code, folder)
+    if rc:
+        return rc
+    review, rc = _process_review(code, folder)
+    if rc:
+        return rc
+    return _process_grok(code, folder, review)
+
+
+def cmd_process(args) -> int:
+    """Official post-offline path. Command first, then one or more catalog codes."""
+    raw_codes = list(getattr(args, "codes", None) or [])
+    codes: list[str] = []
+    for raw in raw_codes:
+        if not looks_like_catalog_code(str(raw)):
+            _die(
+                f"process 只接受番号，收到 {raw!r}。"
+                f"用法: av_auto process 番号 [番号...]  例如: {PROCESS_EXAMPLE}",
+                2,
+            )
+        codes.append(_norm_code(str(raw)))
+    if not codes:
+        _die(f"用法: av_auto process 番号 [番号...]  例如: {PROCESS_EXAMPLE}", 2)
+    failed: list[str] = []
+    for code in codes:
+        try:
+            rc = int(_process_offline_title(code) or 0)
+        except SystemExit as exc:
+            status = exc.code
+            rc = status if isinstance(status, int) and status else 1
+        if rc:
+            failed.append(code)
+            print(
+                f"FAIL {code}: process 停在非 0（{rc}）。不交磁、不刮削、不 promote。",
+                file=sys.stderr,
+            )
+        else:
+            print(f"PROCESS {code}: 完成（未交磁、未刮削、未 promote）")
+    if failed:
+        print("PROCESS 未完成: " + " ".join(failed), file=sys.stderr)
+        print("正确用法: av_auto process " + " ".join(codes), file=sys.stderr)
+        return 1
+    print("PROCESS 全部完成: " + " ".join(codes) + "（未交磁、未刮削、未 promote）")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="av_auto",
-        description="115 av-auto 通路：p115client 交到暂存、清杂质、写正片 strm、加密抽帧、显式 promote。默认不自动搬家。",
+        description=(
+            "115 av-auto 通路：p115client 交到暂存、清杂质、写正片 strm、加密抽帧、显式 promote。默认不自动搬家。\n"
+            "115 离线已经完成后，只用 process（命令在前，番号在后；不交磁、不刮削、不 promote）：\n"
+            f"  {PROCESS_EXAMPLE}"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "番号不是子命令。av_auto ABP-073 clean 会直接报错并提示正确写法。\n"
+            f"  {PROCESS_EXAMPLE}"
+        ),
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -2103,7 +2423,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("codes", nargs="+")
     s.set_defaults(func=cmd_strm)
 
-    s = sub.add_parser("frames", help="对正片 strm 加密抽帧：2分钟起每约8分钟一帧，再补约85%，最多8帧有效帧；默认预检无效则重抽")
+    s = sub.add_parser("frames", help="对正片 strm 加密抽帧：2分钟起每约8分钟一帧，再补约85%%，最多8帧有效帧；默认预检无效则重抽")
     s.add_argument("code", nargs="?", default="")
     s.add_argument("--strm", default="", help="直接指定 strm 路径")
     s.add_argument("--out", default="", help="帧输出目录，默认 /tmp/av-auto-frames/<番号>")
@@ -2142,11 +2462,30 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("codes", nargs="+")
     s.add_argument("--dry-run", action="store_true")
     s.set_defaults(func=cmd_promote)
+
+    s = sub.add_parser(
+        "process",
+        help="115 已离线后：clean→strm→frames→双模型终审→仅未决时 grok-review。不交磁、不刮削、不 promote",
+        description=(
+            "处理一个或多个已经完成 115 离线的暂存番号。\n"
+            "顺序固定：clean → strm → frames → review → grok-review（仅 uncertain 或两家分歧）。\n"
+            "已完成的步骤跳过。不重新交磁，不刮削，不搬进 /AV。\n"
+            "\n"
+            "用法（命令在前，番号在后）：\n"
+            "  av_auto process ABP-073\n"
+            f"  {PROCESS_EXAMPLE}"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    s.add_argument("codes", nargs="+", metavar="番号", help="一个或多个番号，必须写在 process 后面")
+    s.set_defaults(func=cmd_process)
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    incoming = list(sys.argv[1:] if argv is None else argv)
+    reject_code_as_command(incoming)
+    args = build_parser().parse_args(incoming)
     return int(args.func(args) or 0)
 
 

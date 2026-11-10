@@ -1,14 +1,47 @@
 #!/bin/bash
 # grokbot-vm entry
-# For frames/review/grok-review, drop a short-lived Magpie caller-keys copy
+# For frames/review/grok-review/process, drop a short-lived Magpie caller-keys copy
 # into the moviepilot volume so av_auto.py can call Magpie without baking secrets in.
 # grok-review is the tiebreaker only. It does not change the default review models.
+# process is the post-offline path and runs that tiebreaker only when review is unresolved.
+# A catalog code is never a subcommand: `av_auto ABP-073 clean` stops here.
 set -euo pipefail
+
+# Keep in sync with looks_like_catalog_code() / code_as_command_message() in scripts/av_auto.py.
+CATALOG_CODE_RE='^([Ff][Cc]2([-_]?[Pp][Pp][Vv])?[-_]?[0-9]{5,}|[A-Za-z]{2,10}-[0-9]{2,5}|[0-9]{6}[-_][0-9]{2,3})([_-][A-Za-z0-9]+)*$'
+
+is_catalog_code() {
+  [[ "${1:-}" =~ $CATALOG_CODE_RE ]]
+}
+
+cmd_tokens=("$@")
+if [[ "${cmd_tokens[0]:-}" == "--" ]]; then
+  if ((${#cmd_tokens[@]} == 1)); then
+    cmd_tokens=()
+  else
+    cmd_tokens=("${cmd_tokens[@]:1}")
+  fi
+fi
+if ((${#cmd_tokens[@]})) && is_catalog_code "${cmd_tokens[0]}"; then
+  codes=()
+  tokens=("${cmd_tokens[@]}")
+  while ((${#tokens[@]})) && is_catalog_code "${tokens[0]}"; do
+    codes+=("$(printf '%s' "${tokens[0]}" | tr '[:lower:]' '[:upper:]')")
+    if ((${#tokens[@]} == 1)); then
+      tokens=()
+    else
+      tokens=("${tokens[@]:1}")
+    fi
+  done
+  echo "ERROR: '${codes[0]}' 是番号，不是子命令。不要把番号放在子命令前面（av_auto ${cmd_tokens[*]}）。115 离线完成后请用: av_auto process ${codes[*]}（不交磁、不刮削、不 promote）" >&2
+  exit 2
+fi
+
 LLM_SRC=/mnt/user/appdata/magpie/config/magpie/caller-keys.json
 LLM_DST=/mnt/user/appdata/moviepilot/config/scripts/av-auto-fs/llm_runtime.json
 need_llm=0
 case "${1:-}" in
-  frames|review|grok-review) need_llm=1 ;;
+  frames|review|grok-review|process) need_llm=1 ;;
 esac
 if [ "${1:-}" = "intake" ]; then
   for a in "$@"; do
