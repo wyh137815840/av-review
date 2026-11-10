@@ -1,0 +1,28 @@
+# secrets and credentials
+secrets/
+**/*.token
+**/*.key
+**/caller-keys.json
+**/.env
+**/*.env
+**/connection.env
+**/emby.env
+**/media_llm_route.json
+**/*cookie*
+**/*cookies*
+
+# local runtime
+logs/
+run/
+**/__pycache__/
+*.py[cod]
+*.pyo
+.DS_Store
+*.swp
+.venv/
+venv/
+
+# local one-off / work products
+/tmp/
+*.tsv
+verify5.json

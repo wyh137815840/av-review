@@ -1,0 +1,13 @@
+# findav av_review — Asia/Shanghai (this host is already CST).
+# Conservative default: once a day at 19:30, off-peak (avoid weekday 09:00-12:00 and 14:00-18:00).
+# Incremental: review skips mid/low/pilot/rest/grok results; catalog does not auto-submit magnets.
+# Change the schedule by editing this file and running:
+#   crontab /home/yuanhao/av-review/cron/av-review.cron
+# Examples:
+#   30 21 * * *     -> 21:30 every day
+#   0 20 */2 * *    -> 20:00 every other day
+#   30 12 * * 6,0   -> 12:30 weekends only (also off-peak)
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+30 19 * * * /home/yuanhao/av-review/bin/av_review daily --skip-if-busy >> /home/yuanhao/av-review/logs/daily.log 2>&1
+@reboot sleep 20 && /home/yuanhao/av-review/bin/av_review-api-start.sh
