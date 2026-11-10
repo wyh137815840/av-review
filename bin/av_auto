@@ -1,13 +1,14 @@
 #!/bin/bash
 # grokbot-vm entry
-# For frames/review, drop a short-lived Magpie caller-keys copy into the
-# moviepilot volume so av_auto.py can precheck/review without baking secrets in.
+# For frames/review/grok-review, drop a short-lived Magpie caller-keys copy
+# into the moviepilot volume so av_auto.py can call Magpie without baking secrets in.
+# grok-review is the tiebreaker only. It does not change the default review models.
 set -euo pipefail
 LLM_SRC=/mnt/user/appdata/magpie/config/magpie/caller-keys.json
 LLM_DST=/mnt/user/appdata/moviepilot/config/scripts/av-auto-fs/llm_runtime.json
 need_llm=0
 case "${1:-}" in
-  frames|review) need_llm=1 ;;
+  frames|review|grok-review) need_llm=1 ;;
 esac
 if [ "${1:-}" = "intake" ]; then
   for a in "$@"; do

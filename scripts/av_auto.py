@@ -8,6 +8,11 @@ Flow for intake: p115client submit into /av-auto/_staging/<code>/ → wait offli
 → junk-clean (keep feature videos only, move into /av-auto/<code>/, delete leftovers)
 → write strm only for keepers → dense-frame from those strm.
 Promote is explicit and never automatic.
+
+Default final review stays DeepSeek-flash + gpt-6-luna. `grok-review` is a
+separate Magpie tiebreaker for uncertain or split results: it pins
+cursor/grok-4.7 for that call only, writes grok_review.json, and does not
+widen the review ban or touch review.json / media_llm_route.json.
 """
 from __future__ import annotations
 
@@ -57,7 +62,15 @@ LLM_RUNTIME = Path("/config/scripts/av-auto-fs/llm_runtime.json")
 MAGPIE_DEFAULT = "http://192.168.1.9:3430"
 PRECHECK_MODEL = "deepseek/deepseek-flash"
 REVIEW_MODELS = ("deepseek/deepseek-flash", "chatgpt-api/gpt-6-luna")
+# Tiebreaker only. Do not add this to REVIEW_MODELS or drop "grok" from the ban.
+GROK_TIEBREAK_MODEL = "cursor/grok-4.7"
 FORBIDDEN_MODEL_BITS = ("minimax", "grok")
+_VERDICTS = ("pass", "fail", "uncertain")
+_FRAME_EXT = {".jpg", ".jpeg", ".png", ".webp"}
+# Covers, stills, Thumb, Backdrop — never send these to the tiebreaker.
+_BLOCKED_FRAME_RE = re.compile(
+    r"(?i)(?:^|[^a-z0-9])(?:covers?|stills?|thumbs?|thumbnails?|backdrops?)(?:[^a-z0-9]|$)"
+)
 PRECHECK_TO = int(os.environ.get("AV_AUTO_PRECHECK_TIMEOUT", "90"))
 REVIEW_TO = int(os.environ.get("AV_AUTO_REVIEW_TIMEOUT", "180"))
 TZ = ZoneInfo("Asia/Shanghai")
@@ -549,6 +562,11 @@ def _run_ff(args: list[str], timeout: int) -> subprocess.CompletedProcess:
 
 
 def _assert_allowed_model(name: str) -> str:
+    """Reject MiniMax and Grok for precheck and the default dual-model review.
+
+    `grok-review` must not widen this gate. It pins cursor/grok-4.7 in
+    `_grok_tiebreak_once` and never goes through `av_auto review`.
+    """
     n = (name or "").strip()
     low = n.lower()
     if any(bit in low for bit in FORBIDDEN_MODEL_BITS):
@@ -661,8 +679,15 @@ def _data_uri(path: Path) -> str:
     return f"data:{mime};base64," + base64.b64encode(raw).decode()
 
 
-def _magpie_chat(cfg: dict, model: str, images: list[Path], system: str, user_text: str, timeout: int, max_tokens: int) -> dict:
-    model = _assert_allowed_model(model)
+def _post_magpie_chat(cfg: dict, model: str, images: list[Path], system: str, user_text: str, timeout: int, max_tokens: int) -> dict:
+    """POST one Magpie chat. This function is not a model allowlist.
+
+    Precheck and `av_auto review` must call `_magpie_chat`, which still rejects
+    MiniMax and Grok. The tiebreaker calls this only after pinning
+    `cursor/grok-4.7` and does not write media_llm_route.json.
+    """
+    if "minimax" in (model or "").lower():
+        _die(f"拒绝模型 {model}：不用 MiniMax，不改 media_llm_route")
     content = [{"type": "text", "text": user_text}]
     for img in images:
         content.append({"type": "image_url", "image_url": {"url": _data_uri(img)}})
@@ -722,6 +747,11 @@ def _magpie_chat(cfg: dict, model: str, images: list[Path], system: str, user_te
             "error": _redact_media(f"{type(e).__name__}: {e}")[:300],
             "retryable": "timeout" in type(e).__name__.lower() or "timed out" in str(e).lower(),
         }
+
+
+def _magpie_chat(cfg: dict, model: str, images: list[Path], system: str, user_text: str, timeout: int, max_tokens: int) -> dict:
+    model = _assert_allowed_model(model)
+    return _post_magpie_chat(cfg, model, images, system, user_text, timeout, max_tokens)
 
 
 def _chat_retry(cfg, model, images, system, user_text, timeout, max_tokens, tries=3) -> dict:
@@ -1301,6 +1331,387 @@ def cmd_review(args) -> int:
     return 0
 
 
+def _model_short(model: str) -> str:
+    name = str(model or "").rsplit("/", 1)[-1]
+    return name or str(model or "")
+
+
+def _frame_blocked(name: str) -> bool:
+    """True for covers, stills, Thumb, Backdrop and similar non-frame names."""
+    text = str(name or "")
+    base = Path(text).name
+    return bool(_BLOCKED_FRAME_RE.search(base) or _BLOCKED_FRAME_RE.search(text))
+
+
+def _read_json_dict(path: Path) -> dict:
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        _die(f"无法解析 {path.name}（不打印内容）")
+    if not isinstance(obj, dict):
+        _die(f"{path.name} 不是 JSON 对象")
+    return obj
+
+
+def prior_model_verdicts(review: dict) -> dict[str, dict]:
+    """Dual-model rows from review.json, excluding any Grok or MiniMax entry."""
+    models = review.get("models") if isinstance(review, dict) else None
+    out: dict[str, dict] = {}
+    if not isinstance(models, dict):
+        return out
+    for mid, row in models.items():
+        name = str(mid)
+        low = name.lower()
+        if "grok" in low or "minimax" in low:
+            continue
+        if not isinstance(row, dict):
+            continue
+        verdict = row.get("verdict")
+        if verdict not in _VERDICTS:
+            verdict = "uncertain"
+        hits = row.get("hits") if isinstance(row.get("hits"), list) else []
+        out[name] = {
+            "verdict": verdict,
+            "confidence": row.get("confidence") or "",
+            "reason": _redact_media(str(row.get("reason") or ""))[:500],
+            "hits": hits,
+            "ok": bool(row.get("ok")),
+        }
+    return out
+
+
+def tiebreak_trigger(review: dict) -> str:
+    """'disagree' or 'uncertain' when Grok should step in, else ''."""
+    if not isinstance(review, dict):
+        return ""
+    verdicts = [row["verdict"] for row in prior_model_verdicts(review).values()]
+    agreement = str(review.get("agreement") or "")
+    consensus = str(review.get("consensus") or "")
+    if len(verdicts) >= 2:
+        if "pass" in verdicts and "fail" in verdicts:
+            return "disagree"
+        if any(v == "uncertain" for v in verdicts):
+            return "uncertain"
+        if len(set(verdicts)) == 1 and verdicts[0] in ("pass", "fail"):
+            return ""
+    if agreement == "disagree":
+        return "disagree"
+    if agreement == "partial" or consensus == "uncertain":
+        return "uncertain"
+    return ""
+
+
+def review_needs_tiebreak(review: dict) -> bool:
+    """True when a dual-model review is uncertain or the two models disagree."""
+    return tiebreak_trigger(review) != ""
+
+
+def decide_tiebreak(prior: dict[str, str], grok_verdict: str) -> dict:
+    """Pick the verdict to keep. A Grok pass/fail settles an unresolved review."""
+    verdict = grok_verdict if grok_verdict in _VERDICTS else "uncertain"
+    labels = {mid: _model_short(mid) for mid in prior}
+    aligned = [mid for mid, value in prior.items() if value == verdict and verdict in ("pass", "fail")]
+    values = [prior[mid] for mid in prior]
+    split = "pass" in values and "fail" in values
+    if verdict in ("pass", "fail"):
+        kept = verdict
+        kept_from = GROK_TIEBREAK_MODEL
+        resolved = True
+        if split and aligned:
+            who = "、".join(labels[mid] for mid in aligned)
+            conclusion = f"两家分歧。Grok 判 {verdict}，与 {who} 一致，保留 {verdict}。"
+        elif values and all(value == "uncertain" for value in values):
+            conclusion = f"两家均为 uncertain。Grok 判 {verdict}，保留 {verdict}。"
+        elif aligned:
+            who = "、".join(labels[mid] for mid in aligned)
+            conclusion = f"双模型结果未决。Grok 判 {verdict}，与 {who} 一致，保留 {verdict}。"
+        else:
+            conclusion = f"双模型结果未决。Grok 判 {verdict}，以此为准，保留 {verdict}。"
+    else:
+        kept = "uncertain"
+        kept_from = ""
+        aligned = []
+        resolved = False
+        if split:
+            conclusion = "两家分歧。Grok 仍为 uncertain，未能打破平局，保留 uncertain。"
+        else:
+            conclusion = "Grok 仍为 uncertain，本条保持未决，保留 uncertain。"
+    return {
+        "kept_verdict": kept,
+        "kept_from": kept_from,
+        "aligned_with": aligned,
+        "resolved": resolved,
+        "conclusion": conclusion,
+        "prior_verdicts": {mid: prior[mid] for mid in prior},
+        "grok_verdict": verdict,
+    }
+
+
+def grok_tiebreak_hook(review: dict, frames_dir: str, code: str = "") -> dict | None:
+    """Generic argv hint for an external runner, or None when Grok stays out.
+
+    Does not call Magpie, read secrets, scrape, or promote. It does not know
+    about any batch orchestrator.
+    """
+    if not isinstance(review, dict):
+        return None
+    trigger = tiebreak_trigger(review)
+    if not trigger:
+        return None
+    resolved = _norm_code(code or review.get("code") or "")
+    argv = ["grok-review"]
+    if resolved:
+        argv.append(resolved)
+    argv.extend(["--frames-dir", str(frames_dir)])
+    return {"needed": True, "trigger": trigger, "argv": argv}
+
+
+def select_tiebreak_frames(frames_dir: Path, manifest: dict, review: dict) -> list[dict]:
+    """Already-extracted valid frames only.
+
+    Invalid, empty, cover, still, Thumb, and Backdrop files are left out,
+    even if they sit in the same directory.
+    """
+    allowed: set[str] | None = None
+    listed = review.get("valid_frames") if isinstance(review, dict) else None
+    if isinstance(listed, list):
+        allowed = set()
+        for item in listed:
+            if isinstance(item, dict):
+                name = str(item.get("file") or "")
+            else:
+                name = str(item or "")
+            name = Path(name).name
+            if name and not _frame_blocked(name):
+                allowed.add(name)
+    root = frames_dir.resolve()
+    chosen: list[dict] = []
+    seen: set[str] = set()
+    shots = manifest.get("shots") if isinstance(manifest, dict) else None
+    for shot in shots or []:
+        if not isinstance(shot, dict):
+            continue
+        if not shot.get("ok") or shot.get("valid") is not True or shot.get("discarded"):
+            continue
+        raw_name = str(shot.get("file") or "")
+        name = Path(raw_name).name
+        label = str(shot.get("label") or "")
+        if not name or name != raw_name or name in seen:
+            continue
+        if _frame_blocked(name) or _frame_blocked(label):
+            continue
+        if Path(name).suffix.lower() not in _FRAME_EXT:
+            continue
+        if allowed is not None and name not in allowed:
+            continue
+        path = frames_dir / name
+        try:
+            resolved = path.resolve()
+            size = resolved.stat().st_size
+        except (OSError, RuntimeError):
+            continue
+        if resolved.parent != root or not resolved.is_file() or size <= 500:
+            continue
+        seen.add(name)
+        chosen.append({"label": label, "ss": shot.get("ss"), "file": name, "path": resolved})
+    return chosen
+
+
+def build_grok_review_document(
+    *,
+    code: str,
+    frames_dir: str,
+    trigger: str,
+    review: dict,
+    prior: dict[str, dict],
+    frames: list[dict],
+    grok: dict,
+    started_at: str,
+    finished_at: str,
+) -> dict:
+    decision = decide_tiebreak({mid: row["verdict"] for mid, row in prior.items()}, grok.get("verdict") or "")
+    decision["trigger"] = trigger
+    return {
+        "code": code,
+        "role": "tiebreak",
+        "model": GROK_TIEBREAK_MODEL,
+        "frames_dir": frames_dir,
+        "source_review": "review.json",
+        "valid_frames": [{"label": fr.get("label"), "ss": fr.get("ss"), "file": fr.get("file")} for fr in frames],
+        "valid_n": len(frames),
+        "trigger": trigger,
+        "verdict": grok.get("verdict") or "uncertain",
+        "confidence": grok.get("confidence") or "",
+        "reason": grok.get("reason") or "",
+        "kept_verdict": decision["kept_verdict"],
+        "conclusion": decision["conclusion"],
+        "prior": {
+            "agreement": (review or {}).get("agreement") or "",
+            "consensus": (review or {}).get("consensus") or "",
+            "models": prior,
+        },
+        "grok": grok,
+        "tiebreak": decision,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "notes": [
+            "未重跑 DeepSeek-flash / gpt-6-luna。",
+            "未改 review.json，未改 media_llm_route.json。",
+            "未使用 MiniMax，未刮削，未 promote。",
+            "只送已抽出的有效帧，不含封面、剧照、Thumb、Backdrop，不含无效帧。",
+        ],
+    }
+
+
+def _grok_result_fields(rec: dict) -> dict:
+    parsed = rec.get("parsed") if isinstance(rec.get("parsed"), dict) else {}
+    raw_verdict = parsed.get("verdict")
+    verdict = raw_verdict if raw_verdict in _VERDICTS else "uncertain"
+    reason = parsed.get("reason") or rec.get("error") or ""
+    if raw_verdict not in _VERDICTS:
+        reason = reason or "响应无法解析为约定 JSON"
+    hits = parsed.get("hits") if isinstance(parsed.get("hits"), list) else []
+    return {
+        "model": GROK_TIEBREAK_MODEL,
+        "ok": bool(rec.get("ok") and raw_verdict in _VERDICTS),
+        "verdict": verdict,
+        "hits": hits,
+        "reason": _redact_media(str(reason or ""))[:500],
+        "confidence": parsed.get("confidence") or "",
+        "elapsed_s": rec.get("elapsed_s"),
+        "http": rec.get("http"),
+        "attempts": rec.get("attempts") or 1,
+        "usage": rec.get("usage") if isinstance(rec.get("usage"), dict) else {},
+    }
+
+
+def _grok_tiebreak_once(cfg: dict, images: list[Path], user_text: str) -> dict:
+    model = GROK_TIEBREAK_MODEL
+    if model != "cursor/grok-4.7" or "minimax" in model.lower():
+        _die("Grok 复审只允许临时指定 cursor/grok-4.7，不改 media_llm_route，不用 MiniMax")
+    return _post_magpie_chat(cfg, model, images, REVIEW_SYSTEM, user_text, REVIEW_TO, 800)
+
+
+def _grok_tiebreak_chat(cfg: dict, images: list[Path], user_text: str, tries: int = 3) -> dict:
+    last: dict = {}
+    for i in range(1, tries + 1):
+        rec = _grok_tiebreak_once(cfg, images, user_text)
+        rec["attempts"] = i
+        last = rec
+        parsed = rec.get("parsed") if isinstance(rec.get("parsed"), dict) else None
+        if rec.get("ok") and parsed and parsed.get("verdict") in _VERDICTS:
+            return rec
+        if not rec.get("retryable") and not (rec.get("ok") and not parsed):
+            return rec
+        time.sleep(2 * i)
+    return last
+
+
+def _grok_frames_dir(args) -> tuple[str, Path]:
+    code = _norm_code(getattr(args, "code", "") or "")
+    raw = str(getattr(args, "frames_dir", "") or getattr(args, "out", "") or "").strip()
+    if raw:
+        return code, Path(raw)
+    if not code:
+        _die("请指定番号，或用 --frames-dir 指向已有 review.json 的帧目录")
+    out = Path(f"/tmp/av-auto-frames/{code}")
+    alt = Path(f"/config/scripts/av-auto-fs/frames/{code}")
+    if not (out / "review.json").is_file() and (alt / "review.json").is_file():
+        out = alt
+    return code, out
+
+
+def _write_grok_review(frames_dir: Path, doc: dict, secret: str) -> Path:
+    dest = frames_dir / "grok_review.json"
+    review_path = frames_dir / "review.json"
+    if dest.name != "grok_review.json":
+        _die("Grok 复审只能写 grok_review.json")
+    if review_path.exists() and dest.resolve() == review_path.resolve():
+        _die("拒绝覆盖 review.json")
+    text = json.dumps(doc, ensure_ascii=False, indent=2) + "\n"
+    if secret and secret in text:
+        _die("结果里出现了 Key，已中止写入")
+    tmp = frames_dir / "grok_review.json.tmp"
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(dest)
+    return dest
+
+
+def cmd_grok_review(args) -> int:
+    """Tiebreak one existing dual-model review with cursor/grok-4.7.
+
+    Does not rerun DeepSeek or gpt-6-luna, does not change media_llm_route.json,
+    does not overwrite review.json, and does not promote.
+    """
+    code, out = _grok_frames_dir(args)
+    review_path = out / "review.json"
+    if not review_path.is_file():
+        _die(f"找不到 {review_path}。请先跑 av_auto review；Grok 不重跑 DeepSeek / gpt-6-luna。")
+    before = review_path.read_bytes()
+    review = _read_json_dict(review_path)
+    file_code = _norm_code(str(review.get("code") or ""))
+    if code and file_code and code != file_code:
+        _die(f"番号不一致：参数 {code}，review.json 是 {file_code}")
+    code = code or file_code
+    if not code:
+        _die("review.json 里没有番号")
+    trigger = tiebreak_trigger(review)
+    if not trigger:
+        agreement = review.get("agreement") or ""
+        consensus = review.get("consensus") or ""
+        stale = ""
+        if (out / "grok_review.json").is_file():
+            stale = " 已有 grok_review.json 未改动，以这次一致结论为准。"
+        print(f"tiebreak SKIP {agreement}/{consensus}  两家已有明确一致结论，不调用 Grok，不写 grok_review.json。{stale}")
+        return 0
+    manifest_path = out / "frames_manifest.json"
+    if not manifest_path.is_file():
+        _die(f"找不到 {manifest_path}，无法确认有效帧。请使用 av_auto frames 预检后的目录。")
+    manifest = _read_json_dict(manifest_path)
+    if not manifest.get("precheck"):
+        _die("清单未经有效性预检。不要把未预检帧送给 Grok。")
+    frames = select_tiebreak_frames(out, manifest, review)
+    if not frames:
+        _die(f"{code} 没有可送 Grok 的有效帧（无效帧、空帧、封面、剧照、Thumb、Backdrop 都不送）")
+    llm = _load_llm_runtime()
+    captions = "、".join(f"{fr['label']}@{fr['ss']}s" for fr in frames)
+    user = (
+        f"番号 {code}。本请求只附已经抽出的有效抽帧（本地缩图的 data URI，不是网址；"
+        f"不含封面、剧照、Thumb、Backdrop，也不含预检无效的帧）：{captions}。"
+        "请只根据这些帧给出 JSON 判断。"
+    )
+    prior = prior_model_verdicts(review)
+    prior_bits = " ".join(f"{_model_short(mid)}:{row['verdict']}" for mid, row in prior.items())
+    print(
+        f"grok-review {code}: trigger={trigger} prior={prior_bits} frames={len(frames)} → {GROK_TIEBREAK_MODEL}"
+    )
+    started = datetime.now(TZ)
+    rec = _grok_tiebreak_chat(llm, [fr["path"] for fr in frames], user)
+    grok = _grok_result_fields(rec)
+    finished = datetime.now(TZ)
+    doc = build_grok_review_document(
+        code=code,
+        frames_dir=str(out),
+        trigger=trigger,
+        review=review,
+        prior=prior,
+        frames=frames,
+        grok=grok,
+        started_at=started.isoformat(),
+        finished_at=finished.isoformat(),
+    )
+    if review_path.read_bytes() != before:
+        _die("review.json 被改动，已中止，不写 grok_review.json")
+    dest = _write_grok_review(out, doc, str(llm.get("key") or ""))
+    if review_path.read_bytes() != before:
+        _die("review.json 被改动")
+    tag = "KEPT" if doc["tiebreak"]["resolved"] else "UNRESOLVED"
+    print(f"  {GROK_TIEBREAK_MODEL}: {grok['verdict']} {grok['confidence']} {grok['reason']}".rstrip())
+    print(f"tiebreak {tag} {doc['tiebreak']['kept_verdict']}  {doc['tiebreak']['conclusion']}")
+    print(f"→ {dest}")
+    return 0
+
+
 def _emby_refresh(paths: dict, dest: Path) -> str:
     import httpx
 
@@ -1706,6 +2117,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--out", default="", help="帧目录，默认已有的 av-auto-fs/frames/<番号> 或 /tmp/av-auto-frames/<番号>")
     s.add_argument("--cleanup", action="store_true", help="审完删除临时帧（保留清单和 review.json）")
     s.set_defaults(func=cmd_review)
+
+    s = sub.add_parser(
+        "grok-review",
+        help="双模型 uncertain 或分歧时，用 cursor/grok-4.7 做 Magpie 复审；写 grok_review.json，不改 review.json",
+    )
+    s.add_argument("code", nargs="?", default="")
+    s.add_argument("--frames-dir", default="", help="已有 review.json 与有效帧的目录")
+    s.add_argument("--out", default="", help="同 --frames-dir")
+    s.set_defaults(func=cmd_grok_review)
 
     s = sub.add_parser("intake", help="submit→wait→clean→strm；可选抽帧。不刮削、不 promote")
     s.add_argument("--code", required=True)
