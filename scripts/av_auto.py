@@ -3082,7 +3082,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("codes", nargs="*", metavar="番号", help="写在子命令后面。省略则扫整个 findav 库")
     s.add_argument("--dry-run", action="store_true", help="只打印语料计数，不交磁、不抽帧、不审")
-    s.add_argument("--status", action="store_true", help="语料计数加上进度、卡住、BLOCKED 和费用")
+    s.add_argument("--status", action="store_true", help="语料计数加上正在跑的进度：阶段、当前番号、完成/剩余、更新时间")
     s.add_argument("--once", action="store_true", help="只跑一轮调度后退出。默认一直跑，再次执行同一条命令即可恢复")
     s.set_defaults(func=cmd_library_scan)
     return p

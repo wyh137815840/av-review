@@ -110,7 +110,7 @@ if hook:
 
 链接优先用 `av_ed2k`（用 file_name、size_bytes、file_hash 拼 ed2k，同一番号多条时体积最大的在前），否则用 `av_magnet.infohash` 拼 magnet。`source_url` 是页面引用，不当下载地址。写到 mode 600 的临时文件，用 `URI=$(cat file)` 和 `--url "$URI"` 交给提交，然后删掉。标准输出、ssh 命令行和 `progress.json` 都不打印链接。两次交磁间隔约 48 秒。115 返回 406 时退避约 180 秒。出现验证码、911、风控或账号异常时，写下 `library-scan/BLOCKED` 并停止新交磁，已经有文件的番号继续抽帧。离线配额剩余少于 5，或 115 云盘剩余低于 20GiB，也停止新交磁。本地 cache 和 `/media` 要分别看：只有对应文件系统可用空间低于 1GiB 才说磁盘满。cache 上百 GiB、115 云盘还有上万 GiB，都不是磁盘满。下载落在 115，不落在 cache。
 
-正在下载或卡住的番号（进度长时间不动、速率为 0）记入 `in_progress` / `stuck`，然后处理后面的番号，之后再看。进度在容器 `/config/scripts/av-auto-fs/library-scan/progress.json`（宿主机 `/mnt/user/appdata/moviepilot/config/scripts/av-auto-fs/library-scan/progress.json`），包含 queue、done、failed、skipped_no_link、stuck、costs、current。中断后执行同一条命令即可恢复。不读取、也不依赖 `run/av-auto-506` 里的 verify5-pause。
+正在下载或卡住的番号（进度长时间不动、速率为 0）记入 `in_progress` / `stuck`，然后处理后面的番号，之后再看。核对 115 目录时每个番号都会先写进度再查询，标准输出按行刷新，nohup 日志不用等整轮结束。进度在容器 `/config/scripts/av-auto-fs/library-scan/progress.json`（宿主机 `/mnt/user/appdata/moviepilot/config/scripts/av-auto-fs/library-scan/progress.json`），包含 phase、current、updated_at、inventory、queue、done、failed、skipped_no_link、stuck、costs。另一条 `av_auto library-scan --status` 可以在扫描还在跑时读到同一份状态。中断后执行同一条命令即可恢复。不读取、也不依赖 `run/av-auto-506` 里的 verify5-pause。
 
 ```bash
 /home/yuanhao/av-review/bin/av_auto library-scan --dry-run

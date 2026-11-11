@@ -10,6 +10,7 @@ move anything into /AV. Links are never written to progress or stdout.
 from __future__ import annotations
 
 import argparse
+import builtins
 import json
 import os
 import re
@@ -17,6 +18,12 @@ import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+
+def print(*args, **kwargs):  # noqa: A001
+    """Line-flush every operator line. nohup logs stay block-buffered otherwise."""
+    kwargs.setdefault("flush", True)
+    builtins.print(*args, **kwargs)
 
 TZ = ZoneInfo("Asia/Shanghai")
 HARD_SKIP = frozenset({"HPET-022", "MFYD-175"})
@@ -281,6 +288,9 @@ def empty_progress() -> dict:
         "submit_hold": None,
         "counts": {},
         "next_submit_at": "",
+        "phase": "",
+        "inventory_index": 0,
+        "inventory_total": 0,
     }
 
 
@@ -385,6 +395,35 @@ def counts_of(records: list[dict]) -> dict:
         "incomplete": sum(1 for row in remaining if row.get("review") == "incomplete"),
         "remaining": len(remaining),
     }
+
+
+def format_status(progress: dict) -> str:
+    """One line a running scan and ``--status`` both use. No links or secrets."""
+    counts = progress.get("counts") if isinstance(progress.get("counts"), dict) else {}
+    remaining = counts.get("remaining")
+    if remaining is None:
+        remaining = len(progress.get("queue") or [])
+    try:
+        index = int(progress.get("inventory_index") or 0)
+    except (TypeError, ValueError):
+        index = 0
+    try:
+        total = int(progress.get("inventory_total") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    return (
+        "status:"
+        f" phase={progress.get('phase') or '-'}"
+        f" current={progress.get('current') or '-'}"
+        f" done={len(progress.get('done') or {})}"
+        f" remaining={int(remaining or 0)}"
+        f" updated_at={progress.get('updated_at') or '-'}"
+        f" inventory={index}/{total}"
+        f" failed={len(progress.get('failed') or {})}"
+        f" stuck={len(progress.get('stuck') or {})}"
+        f" in_progress={len(progress.get('in_progress') or {})}"
+        f" queue={len(progress.get('queue') or [])}"
+    )
 
 
 def format_counts(counts: dict) -> str:
@@ -785,11 +824,15 @@ def _run_ready(deps, progress: dict, code: str, files: dict, now: datetime) -> s
     action = files.get("action")
     try:
         if action == "process":
+            progress["phase"] = "process"
+            _save(deps, progress, now)
             print(f"library-scan {code}: process（clean→strm→frames→review→必要时 grok-review；不交磁、不刮削、不 promote）")
             rc = int(deps.process_title(code) or 0)
             how = "process"
         elif action == "frames":
             strm = str(files.get("strm") or "")
+            progress["phase"] = "frames"
+            _save(deps, progress, now)
             print(f"library-scan {code}: frames --strm 已有正片，再 review；不交磁、不刮削、不 promote")
             rc = int(deps.frames_title(code, strm) or 0)
             how = "frames"
@@ -870,6 +913,17 @@ def one_pass(deps, progress: dict, records: list[dict], now: datetime) -> str:
     ready: list[tuple[dict, dict]] = []
     waiting: list[tuple[str, dict]] = []
     to_submit: list[dict] = []
+    to_check = [
+        record for record in records
+        if disposition(record) == "work" and not record.get("missing") and not _retry_later(progress, record["code"], now)
+    ]
+    progress["phase"] = "inventory"
+    progress["inventory_index"] = 0
+    progress["inventory_total"] = len(to_check)
+    progress["current"] = ""
+    _save(deps, progress, now)
+    print(f"library-scan: 开始核对 115 上 {len(to_check)} 个番号（不交磁、不刮削、不 promote）")
+    seen = 0
     for record in records:
         if disposition(record) != "work":
             continue
@@ -879,6 +933,13 @@ def one_pass(deps, progress: dict, records: list[dict], now: datetime) -> str:
             continue
         if _retry_later(progress, code, now):
             continue
+        seen += 1
+        progress["phase"] = "inventory"
+        progress["current"] = code
+        progress["inventory_index"] = seen
+        progress["inventory_total"] = len(to_check)
+        _save(deps, progress, now)
+        print(f"library-scan: 核对 115 {seen}/{len(to_check)} {code}")
         try:
             files = deps.files_of(code)
         except Exception as exc:
@@ -924,6 +985,9 @@ def one_pass(deps, progress: dict, records: list[dict], now: datetime) -> str:
         print("library-scan: 帧盘空间不够，本轮不抽帧。不把还够用的盘说成满。")
 
     for code, task in waiting:
+        progress["phase"] = "wait"
+        progress["current"] = code
+        _save(deps, progress, now)
         _observe_waiting(progress, code, task, now, int(deps.stuck_after_sec))
         _save(deps, progress, now)
 
@@ -949,7 +1013,9 @@ def one_pass(deps, progress: dict, records: list[dict], now: datetime) -> str:
             _mark_failed(progress, code, "没有可用链接", now, int(deps.fail_retry_sec))
         else:
             progress["current"] = code
+            progress["phase"] = "submit"
             kind_name = link["kind"]
+            _save(deps, progress, now)
             print(f"library-scan {code}: 提交 {kind_name} 到 /av-auto/_staging（不打印链接，不刮削、不 promote）")
             try:
                 outcome = deps.submit(code, link["uri"])
@@ -994,8 +1060,10 @@ def one_pass(deps, progress: dict, records: list[dict], now: datetime) -> str:
     work_left = [row["code"] for row in records if disposition(row) == "work" and not row.get("missing")]
     unfinished = [code for code in work_left if code not in progress["done"]]
     if not unfinished:
+        progress["phase"] = "finished"
         print("library-scan: 队列里没有还要处理的番号。")
         return "stop"
+    progress["phase"] = "idle"
     if did:
         return "again"
     return "idle"
@@ -1062,15 +1130,7 @@ def execute(args, deps=None) -> int:
         if status:
             progress = load_progress(deps.state_dir / "progress.json")
             blocked = read_blocked(deps.state_dir)
-            print(
-                "status:"
-                f" current={progress.get('current') or '-'}"
-                f" done={len(progress.get('done') or {})}"
-                f" failed={len(progress.get('failed') or {})}"
-                f" stuck={len(progress.get('stuck') or {})}"
-                f" in_progress={len(progress.get('in_progress') or {})}"
-                f" queue={len(progress.get('queue') or [])}"
-            )
+            print(format_status(progress))
             costs = progress.get("costs") or {}
             print(
                 "costs:"

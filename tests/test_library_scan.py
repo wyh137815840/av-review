@@ -391,6 +391,16 @@ class PureTests(unittest.TestCase):
         self.assertEqual(list(root.glob("av-auto-url.*")), [])
 
 
+class FlushLog(io.StringIO):
+    def __init__(self):
+        super().__init__()
+        self.flushes = 0
+
+    def flush(self):
+        self.flushes += 1
+        super().flush()
+
+
 class RunnerTests(unittest.TestCase):
     def _capture(self, deps, **kwargs):
         out = io.StringIO()
@@ -659,8 +669,68 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("done=1", out)
         self.assertIn("stuck=1", out)
         self.assertIn("deepseek_cny=1.5", out)
+        self.assertIn("phase=", out)
+        self.assertIn("updated_at=", out)
+        self.assertIn("remaining=", out)
         self.assertNotIn(URI, out)
         self.assertNotIn("submit", [item[0] for item in deps.calls])
+
+    def test_inventory_writes_progress_before_each_files_of_returns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            deps = Deps(root)
+            deps.load_corpus = lambda: {
+                "titles": [
+                    {"code": "ABP-073", "user_verdict": "pending", "erotic_level": "high"},
+                    {"code": "ABP-108", "user_verdict": "pending", "erotic_level": None},
+                ],
+                "links": {
+                    "ABP-073": {"ed2k": [URI], "magnet": []},
+                    "ABP-108": {"ed2k": [], "magnet": [MAGNET]},
+                },
+            }
+            log = FlushLog()
+            seen = []
+
+            def files_of(code):
+                raw = (root / "progress.json").read_text(encoding="utf-8")
+                self.assertNotIn(URI, raw)
+                self.assertNotIn("magnet:", raw)
+                doc = json.loads(raw)
+                seen.append(dict(doc))
+                self.assertEqual(doc["phase"], "inventory")
+                self.assertEqual(doc["current"], code)
+                self.assertEqual(doc["inventory_total"], 2)
+                self.assertIn(f"核对 115 {doc['inventory_index']}/2 {code}", log.getvalue())
+                self.assertGreater(log.flushes, 0)
+                if code == "ABP-073":
+                    self.assertEqual(doc["inventory_index"], 1)
+                    self.assertNotIn("核对 115 2/2", log.getvalue())
+                line = library_scan.format_status(doc)
+                self.assertIn("phase=inventory", line)
+                self.assertIn(f"current={code}", line)
+                self.assertIn("updated_at=", line)
+                self.assertNotIn(URI, line)
+                return {"action": "none", "strm": ""}
+
+            deps.files_of = files_of
+            err = io.StringIO()
+            with redirect_stdout(log), redirect_stderr(err):
+                rc = library_scan.execute(_args(), deps)
+            self.assertEqual(rc, 0, err.getvalue())
+            self.assertEqual([item["current"] for item in seen], ["ABP-073", "ABP-108"])
+            self.assertEqual([item["inventory_index"] for item in seen], [1, 2])
+            text = log.getvalue() + (root / "progress.json").read_text(encoding="utf-8")
+            self.assertNotIn(URI, text)
+            self.assertNotIn("ed2k://", text)
+            rc, out, _err = self._capture(deps, status=True)
+            self.assertEqual(rc, 0)
+            self.assertIn("phase=", out)
+            self.assertIn("updated_at=", out)
+            self.assertIn("done=", out)
+            self.assertIn("remaining=", out)
+            self.assertIn("inventory=", out)
+            self.assertNotIn(URI, out)
 
 
 class ExportAndHelpTests(unittest.TestCase):
