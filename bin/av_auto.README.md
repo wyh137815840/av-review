@@ -3,7 +3,7 @@
 ## 路径
 - 115 离线暂存 inbox：`/av-auto/_staging/<番号>/`（p115client 交磁/ed2k 落这里）
 - 115 复核 staging：`/av-auto/<番号>/`（清杂质后只留正片；不在 `/AV` 下）
-- 115 正式库：`/AV/<番号>/`（只有显式 `promote` 才搬）
+- 115 正式库：`/AV/<番号>/`（显式 `promote`，或打开自动 promote 开关后，终审 pass 才搬）
 - 本地 staging strm：`/mnt/user/media/av-auto/<番号>/`（Emby 未扫；只给正片建 strm）
 - 本地正式 strm：`/mnt/user/media/AV/...`（Emby 库 `AV`）
 
@@ -34,14 +34,44 @@ av_auto library-scan --status                  # 计数 + 进度 / 卡住 / BLOC
 av_auto library-scan ABP-073                   # 番号写在子命令后面，只跑这几条
 av_auto share-floor                            # 只读：配置 floor、shfs 是否早于 media.cfg、可用空间。不 reload
 av_auto intake --code 番号 --url URI [--frames --review --cleanup]  # 不 promote
-av_auto promote [--dry-run] <番号...>          # 显式搬家；验证条不要自动调用
+av_auto promote [--dry-run] <番号...>          # 显式搬家。已有 /AV/<番号> 则并入，不覆盖同名成片
 ```
+
+## 自动 promote
+
+默认关。调度进程不用停，也不用改它的命令行。`av_auto` 每处理一个番号都会重新读开关：
+
+- 打开：在 Unraid 上执行 `touch /mnt/user/appdata/moviepilot/config/scripts/av-auto-fs/auto_promote.on`（空文件即可）。容器里的路径是 `/config/scripts/av-auto-fs/auto_promote.on`。文件内容写成 `on` / `1` / `true` / `yes` 同样算开。
+- 关掉：删掉这个文件，或把内容写成 `off` / `0` / `false` / `no`。
+- 只影响当前这一次进程：`AV_AUTO_AUTO_PROMOTE=1` 强制开，`AV_AUTO_AUTO_PROMOTE=0` 强制关（盖过文件）。已经在跑的调度进程不会把新环境变量传给它已经启动的子进程；文件开关不依赖环境变量。
+
+已经加载旧脚本的那一条番号会按旧逻辑走完。下一次 `av_auto process` / `review` / `grok-review`（调度器每个番号新开的 python）才会自动搬。
+
+什么叫 pass：
+
+- `review.json` 里 `agreement=agree` 且 `consensus=pass`。这时即使旧的 `grok_review.json` 写着 fail，也搬。
+- 两家 `agree` 且 `consensus=fail`：不搬。旧的 Grok pass 不算数。
+- `disagree`、`partial`，或两家 uncertain：只看 `grok_review.json` 的 `tiebreak.kept_verdict`（没有则看顶层 `kept_verdict`）。等于 `pass` 才搬。
+
+自动搬的是官方 `promote`：115 上把 `/av-auto/<番号>` 搬进 `/AV/<番号>`，写正式 strm，刷新 Emby，再删 staging strm。不重新交磁，不 POST Av115Scraper 再入库。`review` 的模型仍然只有 DeepSeek-flash 和 gpt-6-luna。Grok 只做未决时的 tiebreak，不进默认 review，也不改 `media_llm_route.json`。
+
+`/AV/<番号>` 已经存在时，把 staging 里**不同名**的文件并进这个夹。不新建第二个正式目录，不因为夹已经存在就整条跳过，也不覆盖正式库里同名的成片或 strm。`movie.nfo` 和已有 strm 保持原样。新文件要么全部过去，要么一个都不留在正式库；失败时片子留在 av-auto，staging strm 还在。
+
+部署之后先看、再真搬还在 staging 里的番号（番号从 `av_auto status` 拿，不要把磁链写进命令历史以外的地方）：
+
+```bash
+av_auto promote --dry-run ABP-073 ABP-108
+av_auto promote ABP-073 ABP-108
+```
+
+`--dry-run` 里「新建」是整夹搬到还不存在的 `/AV/<番号>`，「并入已有」是合并进已经在库里的夹。2026-11-11 那次正式 promote 在搬家后用路径查 id，115 的路径索引还指着旧位置，所以每条都报「搬家后核验失败」。现在以正式库父目录的列表里有没有这个夹的 id 为准，不再用那次 0.8 秒的路径查询当回执。
+
 
 `submit` 和 `intake` 的 `--url` 不会原样拼进 ssh 命令行。ed2k 里的 `|`、magnet 里的 `&` 若被远程 shell 再解析一次，会变成管道或后台命令（退出码 126 这一类）。入口把链接写到 Unraid 上 mode 600 的临时文件，远程用 `URI=$(cat file)` 和 `--url "$URI"` 传给 `docker exec`，用完删除。标准输出和 ssh 命令行都不打印链接。
 
 ## 离线完成后：`process`
 
-115 离线已经落到 `/av-auto/_staging/<番号>/` 之后，只用这一条。命令在前，番号在后。可以一次带多个番号。不重新交磁，不刮削，不搬进 `/AV`。
+115 离线已经落到 `/av-auto/_staging/<番号>/` 之后，只用这一条。命令在前，番号在后。可以一次带多个番号。不重新交磁，不刮削。自动 promote 关着的时候不搬进 `/AV`；开关打开后，只有上面定义的 pass 才会走官方 promote。
 
 ```bash
 av_auto process ABP-073
@@ -104,7 +134,7 @@ if hook:
 /home/yuanhao/av-review/bin/av_auto library-scan
 ```
 
-这条命令不刮削，不 promote，不刷新 Emby，不把片子搬进 `/AV`。它只读 findav（`av_title` / `av_ed2k` / `av_magnet`），把还没有文件的番号交到 `/av-auto/_staging/<番号>/`，然后走已经验证过的成片抽帧：需要清杂质或写 strm 时调用 `process`；staging `/media/av-auto/<番号>/` 或确实属于这部的正式 strm 已经在时，调用 `frames --strm <容器路径> <番号>`，再 `review`，只有 uncertain 或两家分歧才 `grok-review`。不送封面、剧照、Thumb、Backdrop，也不调用 `av_review review`。
+这条命令不刮削。它只读 findav（`av_title` / `av_ed2k` / `av_magnet`），把还没有文件的番号交到 `/av-auto/_staging/<番号>/`，然后走已经验证过的成片抽帧：需要清杂质或写 strm 时调用 `process`；staging `/media/av-auto/<番号>/` 或确实属于这部的正式 strm 已经在时，调用 `frames --strm <容器路径> <番号>`，再 `review`，只有 uncertain 或两家分歧才 `grok-review`。不送封面、剧照、Thumb、Backdrop，也不调用 `av_review review`。自动 promote 默认关，所以默认不搬进 `/AV`、不刷新 Emby。开关打开后，它调用的 `process` / `review` / `grok-review` 会按 pass 规则走官方 promote。
 
 `erotic_level` 已有值、`emby_item_id` 为空，都不是跳过理由。`user_verdict=skip`、没有 ed2k/magnet、以及持久目录里已经完成的成片抽帧（有预检有效帧和双模型 `review.json`；未决时还要有对应的 `grok_review.json`）会跳过。只有 manifest、0 帧、没有 review 的目录不算完成。HPET-022 和 MFYD-175 出现就硬跳过。
 
@@ -119,4 +149,4 @@ if hook:
 
 `--dry-run` 和 `--status` 只报告 total、with_link、already_reviewed、skip、no_link、remaining，不交磁、不抽帧。
 
-约束：用 p115client，不用 CloudDrive2；不改 media_llm_route；不刮削。验证条不要自动 promote。
+约束：用 p115client，不用 CloudDrive2；不改 media_llm_route；不刮削。验证条不要打开自动 promote 开关。

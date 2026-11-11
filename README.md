@@ -92,5 +92,5 @@ systemd 用户服务：`av-review-api.service`（linger 已开的话开机自启
 - 不要改 `media_llm_route.json`（期望 mtime 2026-11-10 09:05:53 +0800）。
 - 不要手改 MoviePilot 插件源码。
 - `av_auto review` 仍然只跑 DeepSeek-flash + gpt-6-luna。双模型 uncertain 或分歧时，用单独的 `av_auto grok-review`（见 `bin/av_auto.README.md`），写同目录 `grok_review.json`，不覆盖 `review.json`，也不要把 Grok 放进默认 review。
-- 115 离线已经进 `/av-auto/_staging/` 之后，用 `av_auto process <番号...>` 跑 clean → strm → frames → 双模型终审 → 仅未决时 grok-review。不要把番号写在子命令前面。process 非 0 也会 apply pending；ENOSPC 要区分磁盘满、shareFloor 预留和过期 shfs floor（`av_auto share-floor` 只诊断，不 reload）。见 `bin/av_auto.README.md`。
-- 整个 findav 库用 `av_auto library-scan`（grokbot-vm：`/home/yuanhao/av-review/bin/av_auto library-scan`）。不刮削，不 promote，不刷新 Emby。可中断，再次执行同一条命令恢复。不要改 Unraid 上那份短的 `/mnt/user/appdata/findav/bin/av_auto`。
+- 115 离线已经进 `/av-auto/_staging/` 之后，用 `av_auto process <番号...>` 跑 clean → strm → frames → 双模型终审 → 仅未决时 grok-review。不要把番号写在子命令前面。process 非 0 也会 apply pending；ENOSPC 要区分磁盘满、shareFloor 预留和过期 shfs floor（`av_auto share-floor` 只诊断，不 reload）。自动 promote 默认关；打开方式和 `promote --dry-run` 见 `bin/av_auto.README.md`。
+- 整个 findav 库用 `av_auto library-scan`（grokbot-vm：`/home/yuanhao/av-review/bin/av_auto library-scan`）。不刮削。可中断，再次执行同一条命令恢复。不要改 Unraid 上那份短的 `/mnt/user/appdata/findav/bin/av_auto`。它调用的 `process` 在自动 promote 开关打开时会搬 pass。
