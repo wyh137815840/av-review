@@ -32,9 +32,10 @@ QUOTA_POLL_SEC = 600
 STUCK_POLL_SEC = 1800
 STATE_DIR_DEFAULT = Path("/config/scripts/av-auto-fs/library-scan")
 
-ED2K_URI_COLUMNS = ("ed2k", "ed2k_url", "ed2k_link", "uri", "url", "link")
-MAGNET_URI_COLUMNS = ("magnet", "magnet_url", "magnet_link", "uri", "url", "link")
-CODE_COLUMNS = ("code", "av_code", "title_code")
+# Live findav has no URI column. av_ed2k is file_hash/file_name/size_bytes.
+# av_magnet is infohash. source_url is a page reference, not a download.
+ED2K_FIELDS = ("code", "file_name", "size_bytes", "file_hash")
+MAGNET_FIELDS = ("code", "infohash")
 
 _LINK_RE = re.compile(r"(?i)(?:ed2k://\S+|magnet:\S+)")
 _DROP_KEYS = {
@@ -136,13 +137,68 @@ def _as_int(value) -> int | None:
     return None
 
 
-def pick_column(columns: list[str], preferred: tuple[str, ...]) -> str | None:
-    """Return the first preferred column that exists. Names only, never values."""
-    folded = {str(name).lower(): str(name) for name in columns}
-    for name in preferred:
-        if name.lower() in folded:
-            return folded[name.lower()]
-    return None
+def ed2k_uri(name: str, size: int, file_hash: str) -> str:
+    """Build one ed2k link. Hash is lowercased. aich and source_url are not used."""
+    safe = (name or f"{file_hash}.mp4").replace("|", "_").replace("\n", "").replace("\r", "")
+    return f"ed2k://|file|{safe}|{int(size)}|{file_hash.lower()}|/"
+
+
+def magnet_uri(infohash: str) -> str:
+    """Build one magnet from the infohash only."""
+    digest = (infohash or "").strip().lower()
+    return f"magnet:?xt=urn:btih:{digest}"
+
+
+def _positive_size(value) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float):
+        if not value.is_integer() or value <= 0:
+            return None
+        return int(value)
+    text = str(value).strip()
+    if not text.isdigit():
+        return None
+    number = int(text)
+    return number if number > 0 else None
+
+
+def ed2k_uris_from_rows(rows: list[dict]) -> list[tuple[str, str]]:
+    """(code, uri) largest size_bytes first.
+
+    A row needs code, file_hash, and size_bytes > 0. source_url is ignored.
+    """
+    usable: list[tuple[int, str, str]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        code = str(row.get("code") or "").strip()
+        file_hash = str(row.get("file_hash") or "").strip()
+        size = _positive_size(row.get("size_bytes"))
+        if not code or not file_hash or size is None:
+            continue
+        raw_name = row.get("file_name")
+        name = "" if raw_name is None else str(raw_name)
+        usable.append((size, code, ed2k_uri(name, size, file_hash)))
+    usable.sort(key=lambda item: (-item[0], item[1], item[2]))
+    return [(code, uri) for _size, code, uri in usable]
+
+
+def magnet_uris_from_rows(rows: list[dict]) -> list[tuple[str, str]]:
+    """(code, uri) in code then infohash order. Empty infohash is skipped."""
+    found: list[tuple[str, str]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        code = str(row.get("code") or "").strip()
+        infohash = str(row.get("infohash") or "").strip()
+        if not code or not infohash:
+            continue
+        found.append((code, magnet_uri(infohash)))
+    found.sort(key=lambda item: (item[0], item[1]))
+    return found
 
 
 def pick_link(ed2ks: list[str] | None, magnets: list[str] | None) -> dict | None:

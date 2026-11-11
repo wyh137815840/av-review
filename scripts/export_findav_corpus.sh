@@ -40,44 +40,9 @@ sql() {
     sh "$query"
 }
 
-pick_col() {
-  local table="$1"
-  shift
-  local cols name
-  cols="$(sql "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='${table}'")"
-  for name in "$@"; do
-    if printf '%s\n' "$cols" | tr -d '\r' | grep -qx "$name"; then
-      printf '%s' "$name"
-      return 0
-    fi
-  done
-  return 1
-}
-
-ed2k_code="$(pick_col av_ed2k code av_code title_code)" || {
-  echo "ERROR: av_ed2k 没有番号列。" >&2
-  exit 1
-}
-ed2k_uri="$(pick_col av_ed2k ed2k ed2k_url ed2k_link uri url link)" || {
-  echo "ERROR: av_ed2k 没有链接列。" >&2
-  exit 1
-}
-magnet_code="$(pick_col av_magnet code av_code title_code)" || {
-  echo "ERROR: av_magnet 没有番号列。" >&2
-  exit 1
-}
-magnet_uri="$(pick_col av_magnet magnet magnet_url magnet_link uri url link)" || {
-  echo "ERROR: av_magnet 没有链接列。" >&2
-  exit 1
-}
-
-for ident in "$ed2k_code" "$ed2k_uri" "$magnet_code" "$magnet_uri"; do
-  if [[ ! "$ident" =~ ^[A-Za-z0-9_]+$ ]]; then
-    echo "ERROR: 列名无法安全引用。" >&2
-    exit 1
-  fi
-done
-
+# av_ed2k / av_magnet store hashes, not download URIs.
+# Same formula as library_scan.ed2k_uri / magnet_uri.
+# A page reference column is not a download link and is not selected.
 umask 077
 mkdir -p "$(dirname "$dest")"
 tmp="${dest}.tmp"
@@ -87,11 +52,32 @@ chmod 600 "$tmp"
 sql "SELECT code, IFNULL(user_verdict,'pending'), IFNULL(erotic_level,'') FROM av_title" \
   | awk -F '\t' 'NF >= 1 && $1 != "" { print "T\t" $1 "\t" $2 "\t" $3 }' >> "$tmp"
 
-sql "SELECT \`${ed2k_code}\`, \`${ed2k_uri}\` FROM av_ed2k" \
-  | awk -F '\t' 'NF >= 2 && $1 != "" && $2 != "" { print "E\t" $1 "\t" $2 }' >> "$tmp"
+sql "SELECT TRIM(code), REPLACE(REPLACE(IFNULL(file_name, ''), CHAR(10), ''), CHAR(13), ''), IFNULL(size_bytes, 0), TRIM(IFNULL(file_hash, '')) FROM av_ed2k" \
+  | awk -F '\t' '
+      $1 != "" && $4 != "" && $3 ~ /^[0-9]+$/ && ($3 + 0) > 0 {
+        hash = $4
+        name = $2
+        if (name == "") name = hash ".mp4"
+        gsub(/\|/, "_", name)
+        gsub(/\r/, "", name)
+        gsub(/\n/, "", name)
+        printf "%d\t%s\ted2k://|file|%s|%d|%s|/\n", ($3 + 0), $1, name, ($3 + 0), tolower(hash)
+      }
+    ' \
+  | LC_ALL=C sort -t "$(printf '\t')" -k1,1nr -k2,2 -k3,3 \
+  | awk -F '\t' '{ printf "E\t%s\t%s\n", $2, $3 }' >> "$tmp"
 
-sql "SELECT \`${magnet_code}\`, \`${magnet_uri}\` FROM av_magnet" \
-  | awk -F '\t' 'NF >= 2 && $1 != "" && $2 != "" { print "M\t" $1 "\t" $2 }' >> "$tmp"
+sql "SELECT TRIM(code), IFNULL(infohash, '') FROM av_magnet" \
+  | awk -F '\t' '
+      {
+        code = $1
+        hash = $2
+        gsub(/^[ \t]+|[ \t]+$/, "", hash)
+        if (code != "" && hash != "") printf "%s\t%s\n", code, tolower(hash)
+      }
+    ' \
+  | LC_ALL=C sort -t "$(printf '\t')" -k1,1 -k2,2 \
+  | awk -F '\t' '{ printf "M\t%s\tmagnet:?xt=urn:btih:%s\n", $1, $2 }' >> "$tmp"
 
 titles="$(awk -F '\t' '$1 == "T" { n++ } END { print n + 0 }' "$tmp")"
 ed2k_rows="$(awk -F '\t' '$1 == "E" { n++ } END { print n + 0 }' "$tmp")"

@@ -160,6 +160,74 @@ def _names(deps: Deps, kind: str):
 
 
 class PureTests(unittest.TestCase):
+    def test_live_schema_rows_build_ed2k_then_magnet_without_source_url(self):
+        page = "http://example.test/not-a-download"
+        ed2k_rows = [
+            {
+                "code": "ABP-073",
+                "file_name": "ad.mp4",
+                "size_bytes": 1000,
+                "file_hash": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+                "aich_hash": "SHOULD_NOT_APPEAR",
+                "source_url": page,
+            },
+            {
+                "code": "ABP-073",
+                "file_name": "ABP-073|feature.mp4",
+                "size_bytes": "2000000000",
+                "file_hash": "ABCDEF0123456789ABCDEF0123456789",
+                "source_url": page,
+            },
+            {
+                "code": "NONAME",
+                "file_name": "",
+                "size_bytes": 4096,
+                "file_hash": "AbC",
+                "source_url": page,
+            },
+            {"code": "NOHASH", "file_name": "x.mp4", "size_bytes": 5000, "file_hash": "", "source_url": page},
+            {"code": "NOSIZE", "file_name": "x.mp4", "size_bytes": 0, "file_hash": "CC", "source_url": page},
+            {"code": "NONEG", "file_name": "x.mp4", "size_bytes": None, "file_hash": "DD", "source_url": page},
+            {"code": "  ", "file_name": "x.mp4", "size_bytes": 10, "file_hash": "EE", "source_url": page},
+        ]
+        built = library_scan.ed2k_uris_from_rows(ed2k_rows)
+        self.assertEqual(
+            built,
+            [
+                ("ABP-073", library_scan.ed2k_uri("ABP-073|feature.mp4", 2000000000, "ABCDEF0123456789ABCDEF0123456789")),
+                ("NONAME", library_scan.ed2k_uri("", 4096, "AbC")),
+                ("ABP-073", library_scan.ed2k_uri("ad.mp4", 1000, "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB")),
+            ],
+        )
+        self.assertEqual(
+            built[0][1],
+            "ed2k://|file|ABP-073_feature.mp4|2000000000|abcdef0123456789abcdef0123456789|/",
+        )
+        self.assertEqual(built[1][1], "ed2k://|file|AbC.mp4|4096|abc|/")
+        joined = "\n".join(uri for _code, uri in built)
+        self.assertNotIn(page, joined)
+        self.assertNotIn("SHOULD_NOT_APPEAR", joined)
+        self.assertEqual(library_scan.ed2k_uri("a|b\nc\r", 3, "FF"), "ed2k://|file|a_bc|3|ff|/")
+
+        magnet_rows = [
+            {"code": "ABP-246", "infohash": "0123456789abcdef0123456789ABCDEF", "name": "later", "source_url": page},
+            {"code": "ABP-108", "infohash": "  AbCDEF0123456789ABCDEF0123456789  ", "tracker_hint": "nope"},
+            {"code": "NOMAG", "infohash": "  ", "source_url": page},
+            {"code": "", "infohash": "abcdef", "source_url": page},
+        ]
+        magnets = library_scan.magnet_uris_from_rows(magnet_rows)
+        self.assertEqual(
+            magnets,
+            [
+                ("ABP-108", "magnet:?xt=urn:btih:abcdef0123456789abcdef0123456789"),
+                ("ABP-246", "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef"),
+            ],
+        )
+        self.assertNotIn(page, "\n".join(uri for _code, uri in magnets))
+        picked = library_scan.pick_link([item[1] for item in built if item[0] == "ABP-073"], [magnets[0][1]])
+        self.assertEqual(picked["kind"], "ed2k")
+        self.assertIn("ABP-073_feature.mp4", picked["uri"])
+
     def test_pick_link_prefers_ed2k_and_ignores_junk(self):
         picked = library_scan.pick_link([URI, "http://nope"], [MAGNET])
         self.assertEqual(picked["kind"], "ed2k")
@@ -596,11 +664,9 @@ class RunnerTests(unittest.TestCase):
 
 
 class ExportAndHelpTests(unittest.TestCase):
-    def test_export_writes_mode_600_and_does_not_print_links_or_password(self):
+    def test_export_builds_uris_from_hash_columns_and_skips_source_url(self):
         secret = "super-secret-password"
-        uri = "ed2k://|file|export-secret|9|abcdef|/ "
-        uri = uri.strip()
-        magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=hidden"
+        page = "http://example.test/not-a-download"
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             env = root / "connection.env"
@@ -618,26 +684,42 @@ class ExportAndHelpTests(unittest.TestCase):
             os.chmod(env, 0o600)
             fake = root / "bin"
             fake.mkdir()
-            log = root / "docker.jsonl"
+            query_log = root / "queries.txt"
             (fake / "docker").write_text(
                 "#!/usr/bin/env python3\n"
                 "import os, sys\n"
+                "from pathlib import Path\n"
                 "argv = sys.argv[1:]\n"
                 "pwd = os.environ.get('MYSQL_PWD', '')\n"
                 "if pwd and pwd in ' '.join(argv):\n"
                 "    sys.stderr.write('password on argv\\n')\n"
                 "    raise SystemExit(9)\n"
                 "query = argv[-1] if argv else ''\n"
-                "if 'information_schema' in query and 'av_ed2k' in query:\n"
-                "    sys.stdout.write('id\\ncode\\ned2k\\nsource\\n')\n"
-                "elif 'information_schema' in query and 'av_magnet' in query:\n"
-                "    sys.stdout.write('id\\ncode\\nmagnet\\nsubmit_status\\n')\n"
-                "elif 'FROM av_title' in query:\n"
+                "Path(os.environ['QUERY_LOG']).open('a', encoding='utf-8').write(query + '\\n')\n"
+                "if 'source_url' in query:\n"
+                "    sys.stderr.write('source_url selected\\n')\n"
+                "    raise SystemExit(3)\n"
+                "if 'FROM av_title' in query:\n"
                 "    sys.stdout.write('ABP-073\\tpending\\thigh\\n')\n"
+                "    sys.stdout.write('ABP-108\\tpending\\t\\n')\n"
                 "elif 'FROM av_ed2k' in query:\n"
-                "    sys.stdout.write('ABP-073\\t' + " + repr(uri) + " + '\\n')\n"
+                "    if 'file_hash' not in query or 'size_bytes' not in query:\n"
+                "        sys.stderr.write('ed2k columns missing\\n')\n"
+                "        raise SystemExit(4)\n"
+                "    sys.stdout.write('ABP-073\\tad.mp4\\t1000\\tBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\\n')\n"
+                "    sys.stdout.write('ABP-073\\tABP-073|feature.mp4\\t2000000000\\tABCDEF0123456789ABCDEF0123456789\\n')\n"
+                "    sys.stdout.write('NONAME\\t\\t4096\\tAbC\\n')\n"
+                "    sys.stdout.write('NOHASH\\tx.mp4\\t5000\\t\\n')\n"
+                "    sys.stdout.write('NOSIZE\\tx.mp4\\t0\\tCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\\n')\n"
+                "    sys.stdout.write('\\tx.mp4\\t10\\tDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD\\n')\n"
                 "elif 'FROM av_magnet' in query:\n"
-                "    sys.stdout.write('ABP-108\\t' + " + repr(magnet) + " + '\\n')\n"
+                "    if 'infohash' not in query:\n"
+                "        sys.stderr.write('infohash missing\\n')\n"
+                "        raise SystemExit(5)\n"
+                "    sys.stdout.write('ABP-246\\t0123456789abcdef0123456789ABCDEF\\n')\n"
+                "    sys.stdout.write('ABP-108\\t  AbCDEF0123456789ABCDEF0123456789  \\n')\n"
+                "    sys.stdout.write('NOMAG\\t   \\n')\n"
+                "    sys.stdout.write('\\tabcdef\\n')\n"
                 "else:\n"
                 "    sys.stderr.write('unexpected\\n')\n"
                 "    raise SystemExit(2)\n",
@@ -649,6 +731,7 @@ class ExportAndHelpTests(unittest.TestCase):
             env_run["PATH"] = str(fake) + os.pathsep + env_run.get("PATH", "")
             env_run["AV_AUTO_FINDAV_ENV"] = str(env)
             env_run["FINDAV_DB_CONTAINER"] = "findav-db"
+            env_run["QUERY_LOG"] = str(query_log)
             result = subprocess.run(
                 ["bash", str(ROOT / "scripts" / "export_findav_corpus.sh"), str(dest)],
                 capture_output=True,
@@ -658,18 +741,48 @@ class ExportAndHelpTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             blob = result.stdout + result.stderr
+            queries = query_log.read_text(encoding="utf-8")
             self.assertNotIn(secret, blob)
-            self.assertNotIn(uri, blob)
-            self.assertNotIn(magnet, blob)
             self.assertNotIn("ed2k://", blob)
-            self.assertIn("titles=1", result.stdout)
-            self.assertIn("ed2k_rows=1", result.stdout)
+            self.assertNotIn("magnet:", blob)
+            self.assertNotIn(page, blob)
+            self.assertNotIn("source_url", queries)
+            self.assertIn("titles=2", result.stdout)
+            self.assertIn("ed2k_rows=3", result.stdout)
+            self.assertIn("magnet_rows=2", result.stdout)
             text = dest.read_text(encoding="utf-8")
-            self.assertIn(uri, text)
+            self.assertNotIn(page, text)
             self.assertEqual(stat.S_IMODE(dest.stat().st_mode), 0o600)
             parsed = library_scan.parse_corpus_tsv(text)
-            picked = library_scan.pick_link(parsed["links"]["ABP-073"]["ed2k"], [])
-            self.assertEqual(picked["kind"], "ed2k")
+            expected_ed2k = library_scan.ed2k_uris_from_rows([
+                {"code": "ABP-073", "file_name": "ad.mp4", "size_bytes": 1000, "file_hash": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", "source_url": page},
+                {"code": "ABP-073", "file_name": "ABP-073|feature.mp4", "size_bytes": 2000000000, "file_hash": "ABCDEF0123456789ABCDEF0123456789", "source_url": page},
+                {"code": "NONAME", "file_name": "", "size_bytes": 4096, "file_hash": "AbC"},
+                {"code": "NOHASH", "file_name": "x.mp4", "size_bytes": 5000, "file_hash": ""},
+                {"code": "NOSIZE", "file_name": "x.mp4", "size_bytes": 0, "file_hash": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"},
+            ])
+            got_ed2k = []
+            for line in text.splitlines():
+                if line.startswith("E\t"):
+                    _kind, code, uri = line.split("\t", 2)
+                    got_ed2k.append((code, uri))
+            self.assertEqual(got_ed2k, expected_ed2k)
+            expected_magnets = library_scan.magnet_uris_from_rows([
+                {"code": "ABP-246", "infohash": "0123456789abcdef0123456789ABCDEF"},
+                {"code": "ABP-108", "infohash": "  AbCDEF0123456789ABCDEF0123456789  "},
+                {"code": "NOMAG", "infohash": "   "},
+            ])
+            got_magnets = []
+            for line in text.splitlines():
+                if line.startswith("M\t"):
+                    _kind, code, uri = line.split("\t", 2)
+                    got_magnets.append((code, uri))
+            self.assertEqual(got_magnets, expected_magnets)
+            picked = library_scan.pick_link(parsed["links"]["ABP-073"]["ed2k"], parsed["links"].get("ABP-108", {}).get("magnet"))
+            self.assertEqual(picked["uri"], expected_ed2k[0][1])
+            self.assertNotIn("NOHASH", parsed["links"])
+            self.assertNotIn("NOSIZE", parsed["links"])
+            self.assertNotIn("NOMAG", parsed["links"])
 
     def test_help_puts_the_code_after_the_subcommand(self):
         rc, out, err = _run_main(["--help"])
@@ -697,12 +810,13 @@ class ExportAndHelpTests(unittest.TestCase):
         self.assertNotIn("verify5", text)
         self.assertNotIn("ed2k://|file|", text)
         self.assertNotIn("super-secret", text)
-        self.assertIn("ed2k ed2k_url ed2k_link uri url link", script)
-        self.assertIn("magnet magnet_url magnet_link uri url link", script)
-        self.assertEqual(
-            " ".join(library_scan.ED2K_URI_COLUMNS),
-            "ed2k ed2k_url ed2k_link uri url link",
-        )
+        self.assertNotIn("ed2k_url", script)
+        self.assertNotIn("source_url", script)
+        self.assertIn("file_hash", script)
+        self.assertIn("size_bytes", script)
+        self.assertIn("infohash", script)
+        self.assertEqual(library_scan.ED2K_FIELDS, ("code", "file_name", "size_bytes", "file_hash"))
+        self.assertEqual(library_scan.MAGNET_FIELDS, ("code", "infohash"))
         syntax = subprocess.run(["bash", "-n", str(ROOT / "bin" / "av_auto")], capture_output=True, text=True)
         self.assertEqual(syntax.returncode, 0, syntax.stderr)
         export_syntax = subprocess.run(
