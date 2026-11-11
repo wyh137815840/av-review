@@ -9,9 +9,12 @@ Flow for intake: p115client submit into /av-auto/_staging/<code>/ → wait offli
 → write strm only for keepers → dense-frame from those strm.
 Promote is explicit and never automatic.
 
-After offline is already finished, `process` is the only end-to-end entry:
+After offline is already finished, `process` is the post-offline entry:
 clean → strm → frames → dual-model review → grok-review when uncertain or split.
 It does not submit, scrape, or promote. A catalog code is never a subcommand.
+
+`library-scan` is the full findav library runner. It may submit into staging,
+then uses `process` or `frames --strm` + review. It never scrapes or promotes.
 Completed frames, review.json, and any grok_review.json are written to
 /config/scripts/av-auto-fs/frames/<code>/ before the run reports success.
 A container /tmp/av-auto-frames copy alone is not success.
@@ -2364,9 +2367,10 @@ def _redact_result(obj) -> str:
     return _redact_media(text)[:500]
 
 
-def cmd_submit(args) -> int:
-    code = _norm_code(args.code)
-    url = (args.url or "").strip()
+def perform_submit(code: str, url: str) -> dict:
+    """Submit into /av-auto/_staging/<code>/. Does not print the URI."""
+    code = _norm_code(code)
+    url = (url or "").strip()
     if not code or not url:
         _die("用法: av_auto submit --code 番号 --url 磁链或ed2k")
     if not (url.startswith("magnet:") or url.startswith("ed2k://") or url.startswith("http")):
@@ -2381,18 +2385,36 @@ def cmd_submit(args) -> int:
     dest_id = pan.ensure_dir(dest)
     if not _id_ok(dest_id):
         _die(f"无法创建 {dest}")
-    # already have keepers in /av-auto/<code>? still allow submit for verify, but warn
     lib = f"{paths['staging_115'].rstrip('/')}/{code}"
     if _id_ok(pan.dir_id(lib)) and _videos_in(pan, pan.dir_id(lib)):
         print(f"NOTE {code}: {lib} 里已有正片，仍提交到 inbox")
     result = pan.add_magnet(url, dest_id)
     state = result.get("state") if isinstance(result, dict) else None
-    errno = result.get("errno") or result.get("error_code") or result.get("errcode")
-    print(f"SUBMIT {code} → {dest} state={state} errno={errno}")
+    errno = None
+    if isinstance(result, dict):
+        errno = result.get("errno") or result.get("error_code") or result.get("errcode")
+    failed = isinstance(result, dict) and (
+        state is False or (errno not in (None, 0, "0") and state not in (True, 1, "1"))
+    )
+    return {
+        "rc": 1 if failed else 0,
+        "result": result if isinstance(result, dict) else {"message": "non-dict"},
+        "dest": dest,
+    }
+
+
+def cmd_submit(args) -> int:
+    code = _norm_code(args.code)
+    url = (args.url or "").strip()
+    out = perform_submit(code, url)
+    result = out["result"]
+    state = result.get("state") if isinstance(result, dict) else None
+    errno = None
+    if isinstance(result, dict):
+        errno = result.get("errno") or result.get("error_code") or result.get("errcode")
+    print(f"SUBMIT {code} → {out['dest']} state={state} errno={errno}")
     print(_redact_result(result))
-    if isinstance(result, dict) and (state is False or (errno not in (None, 0, "0") and state not in (True, 1, "1"))):
-        return 1
-    return 0
+    return int(out["rc"])
 
 
 def cmd_wait(args) -> int:
@@ -2960,7 +2982,9 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "番号不是子命令。av_auto ABP-073 clean 会直接报错并提示正确写法。\n"
-            f"  {PROCESS_EXAMPLE}"
+            f"  {PROCESS_EXAMPLE}\n"
+            "整个 findav 库的成片抽帧（可中断后续跑，不刮削、不 promote）：\n"
+            "  av_auto library-scan"
         ),
     )
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -3047,6 +3071,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("codes", nargs="+", metavar="番号", help="一个或多个番号，必须写在 process 后面")
     s.set_defaults(func=cmd_process)
+
+    from library_scan import LIBRARY_SCAN_EXAMPLES, cmd_library_scan
+
+    s = sub.add_parser(
+        "library-scan",
+        help="整个 findav 库成片抽帧。可中断后续跑。不刮削、不 promote、不刷新 Emby",
+        description=LIBRARY_SCAN_EXAMPLES,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    s.add_argument("codes", nargs="*", metavar="番号", help="写在子命令后面。省略则扫整个 findav 库")
+    s.add_argument("--dry-run", action="store_true", help="只打印语料计数，不交磁、不抽帧、不审")
+    s.add_argument("--status", action="store_true", help="语料计数加上进度、卡住、BLOCKED 和费用")
+    s.add_argument("--once", action="store_true", help="只跑一轮调度后退出。默认一直跑，再次执行同一条命令即可恢复")
+    s.set_defaults(func=cmd_library_scan)
     return p
 
 

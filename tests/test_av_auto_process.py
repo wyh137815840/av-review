@@ -478,7 +478,7 @@ class ShellEntryTests(unittest.TestCase):
         syntax = subprocess.run(["bash", "-n", str(ROOT / "bin" / "av_auto")], capture_output=True, text=True)
         self.assertEqual(syntax.returncode, 0, syntax.stderr)
         text = (ROOT / "bin" / "av_auto").read_text(encoding="utf-8")
-        self.assertIn("frames|review|grok-review|process)", text)
+        self.assertIn("frames|review|grok-review|process|library-scan)", text)
 
         with tempfile.TemporaryDirectory() as tmp:
             rc, err, logged = self._invoke(Path(tmp), ["ABP-073", "clean"])

@@ -6,6 +6,7 @@
 # file, so one run cannot delete the file another official run still has open.
 # grok-review is the tiebreaker only. It does not change the default review models.
 # process is the post-offline path and runs that tiebreaker only when review is unresolved.
+# library-scan is the full findav runner. It does not scrape or promote.
 # A catalog code is never a subcommand: `av_auto ABP-073 clean` stops here.
 # set -e must not skip av_auto_apply_fs when python exits non-zero. Pending
 # mkdir/write_text jobs are how strm lands after shfs returns ENOSPC.
@@ -158,7 +159,7 @@ LLM_DST=""
 LLM_CONTAINER=""
 need_llm=0
 case "${1:-}" in
-  frames|review|grok-review|process) need_llm=1 ;;
+  frames|review|grok-review|process|library-scan) need_llm=1 ;;
 esac
 if [ "${1:-}" = "intake" ]; then
   for a in "$@"; do
@@ -175,6 +176,18 @@ if [ "${1:-}" = "frames" ]; then
     [ "$a" = "--no-precheck" ] && skip=1
   done
   need_llm=$((1 - skip))
+fi
+library_scan_help=0
+CORPUS_RC=0
+if [ "${1:-}" = "library-scan" ]; then
+  for a in "$@"; do
+    case "$a" in
+      --dry-run|--status|-h|--help) need_llm=0 ;;
+    esac
+    case "$a" in
+      -h|--help) library_scan_help=1 ;;
+    esac
+  done
 fi
 
 cleanup_llm() {
@@ -202,17 +215,61 @@ cleanup_remote_url() {
   REMOTE_URL_FILE=""
 }
 
+cleanup_corpus() {
+  if [ -z "${REMOTE_CORPUS:-}" ]; then
+    return 0
+  fi
+  # The corpus holds ed2k/magnet values. Delete it without printing those values.
+  ssh -o BatchMode=yes root@192.168.1.9 "rm -f -- $(printf '%q' "$REMOTE_CORPUS") $(printf '%q' "${REMOTE_CORPUS}.tmp")" || true
+  REMOTE_CORPUS=""
+}
+
+prepare_library_corpus() {
+  local script dest_q log rc
+  script="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/../scripts/export_findav_corpus.sh"
+  if [ ! -f "$script" ]; then
+    echo "ERROR: 缺少 export_findav_corpus.sh。" >&2
+    return 1
+  fi
+  CORPUS_ID="${RANDOM}-$$-$(date +%s)"
+  REMOTE_CORPUS="/mnt/user/appdata/moviepilot/config/scripts/av-auto-fs/library-scan/corpus.${CORPUS_ID}.tsv"
+  CONTAINER_CORPUS="/config/scripts/av-auto-fs/library-scan/corpus.${CORPUS_ID}.tsv"
+  dest_q="$(printf '%q' "$REMOTE_CORPUS")"
+  log="$(mktemp)"
+  set +e
+  ssh -o BatchMode=yes root@192.168.1.9 "bash -s -- ${dest_q}" < "$script" >"$log" 2>&1
+  rc=$?
+  set -e
+  if grep -E 'ed2k://|magnet:' "$log" >/dev/null 2>&1; then
+    echo "ERROR: 语料导出输出里出现了链接，已中止。" >&2
+    rm -f "$log"
+    return 1
+  fi
+  if [ "$rc" -ne 0 ]; then
+    cat "$log" >&2
+    rm -f "$log"
+    return "$rc"
+  fi
+  cat "$log"
+  rm -f "$log"
+}
+
 cleanup_on_exit() {
   cleanup_llm
   cleanup_local_url
   cleanup_remote_url
+  cleanup_corpus
 }
 
 # ed2k '|' and magnet '&' must not reach the remote shell as syntax.
 # Write the URL to a mode-600 file, then docker exec --url "$URI".
 run_python_remote() {
+  ssh_opts=(-o BatchMode=yes)
+  if [ "${1:-}" = "library-scan" ]; then
+    ssh_opts+=(-o ServerAliveInterval=30 -o ServerAliveCountMax=120)
+  fi
   if [ "$HAS_URL" != 1 ]; then
-    ssh -o BatchMode=yes root@192.168.1.9 docker exec "${docker_env[@]}" moviepilot python3 /config/scripts/av_auto.py "$@"
+    ssh "${ssh_opts[@]}" root@192.168.1.9 docker exec "${docker_env[@]}" moviepilot python3 /config/scripts/av_auto.py "$@"
     return $?
   fi
   LOCAL_URL_FILE=$(mktemp) || return $?
@@ -221,7 +278,7 @@ run_python_remote() {
   unset URL_VALUE
   REMOTE_URL_FILE="/tmp/av-auto-url.${RANDOM}-$$-$(date +%s)"
   remote_cmd="umask 077; cat > $(printf '%q' "$REMOTE_URL_FILE") && chmod 600 $(printf '%q' "$REMOTE_URL_FILE")"
-  ssh -o BatchMode=yes root@192.168.1.9 "$remote_cmd" < "$LOCAL_URL_FILE"
+  ssh "${ssh_opts[@]}" root@192.168.1.9 "$remote_cmd" < "$LOCAL_URL_FILE"
   up_rc=$?
   rm -f -- "$LOCAL_URL_FILE"
   LOCAL_URL_FILE=""
@@ -236,7 +293,7 @@ run_python_remote() {
     args_q=$(printf '%q ' "$@")
   fi
   remote_q=$(printf '%q' "$REMOTE_URL_FILE")
-  ssh -o BatchMode=yes root@192.168.1.9 bash -s <<REMOTE
+  ssh "${ssh_opts[@]}" root@192.168.1.9 bash -s <<REMOTE
 set -euo pipefail
 url_file=${remote_q}
 cleanup() { rm -f -- "\$url_file"; }
@@ -278,9 +335,20 @@ fi
 if [ -n "$LLM_CONTAINER" ]; then
   docker_env+=(-e "AV_AUTO_LLM_FILE=${LLM_CONTAINER}")
 fi
+if [ "${1:-}" = "library-scan" ] && [ "$library_scan_help" != 1 ]; then
+  trap cleanup_on_exit EXIT
+  if ! prepare_library_corpus; then
+    CORPUS_RC=1
+  else
+    docker_env+=(-e "AV_AUTO_CORPUS_FILE=${CONTAINER_CORPUS}")
+  fi
+fi
 
 rc=0
-if [ "$need_llm" = 1 ]; then
+if [ "$CORPUS_RC" -ne 0 ]; then
+  rc="$CORPUS_RC"
+fi
+if [ "$need_llm" = 1 ] && [ "$rc" -eq 0 ]; then
   set +e
   ssh -o BatchMode=yes root@192.168.1.9 bash -s << REMOTE
 set -euo pipefail

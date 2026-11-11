@@ -28,6 +28,10 @@ av_auto frames --no-precheck                   # 只抽不预检（官方库对�
 av_auto review <番号>                          # 仅有效帧双模型终审（DeepSeek-flash + gpt-6-luna）
 av_auto grok-review <番号> --frames-dir <帧目录>  # 仅 uncertain / 分歧时的 Grok 复审
 av_auto process <番号...>                      # 离线已完成后的官方后处理，见下文
+av_auto library-scan                           # 整个 findav 库。可中断后续跑。不刮削、不 promote
+av_auto library-scan --dry-run                 # 只打印语料计数
+av_auto library-scan --status                  # 计数 + 进度 / 卡住 / BLOCKED / 费用
+av_auto library-scan ABP-073                   # 番号写在子命令后面，只跑这几条
 av_auto share-floor                            # 只读：配置 floor、shfs 是否早于 media.cfg、可用空间。不 reload
 av_auto intake --code 番号 --url URI [--frames --review --cleanup]  # 不 promote
 av_auto promote [--dry-run] <番号...>          # 显式搬家；验证条不要自动调用
@@ -91,5 +95,28 @@ if hook:
     # hook["argv"] 例如 ["grok-review", "IPX-750", "--frames-dir", "..."]
     ...
 ```
+
+## 整个 findav 库：`library-scan`
+
+在 grokbot-vm 上启动一次，然后让它自己跑。不要用 Unraid 上那份短的 `/mnt/user/appdata/findav/bin/av_auto`。
+
+```bash
+/home/yuanhao/av-review/bin/av_auto library-scan
+```
+
+这条命令不刮削，不 promote，不刷新 Emby，不把片子搬进 `/AV`。它只读 findav（`av_title` / `av_ed2k` / `av_magnet`），把还没有文件的番号交到 `/av-auto/_staging/<番号>/`，然后走已经验证过的成片抽帧：需要清杂质或写 strm 时调用 `process`；staging `/media/av-auto/<番号>/` 或确实属于这部的正式 strm 已经在时，调用 `frames --strm <容器路径> <番号>`，再 `review`，只有 uncertain 或两家分歧才 `grok-review`。不送封面、剧照、Thumb、Backdrop，也不调用 `av_review review`。
+
+`erotic_level` 已有值、`emby_item_id` 为空，都不是跳过理由。`user_verdict=skip`、没有 ed2k/magnet、以及持久目录里已经完成的成片抽帧（有预检有效帧和双模型 `review.json`；未决时还要有对应的 `grok_review.json`）会跳过。只有 manifest、0 帧、没有 review 的目录不算完成。HPET-022 和 MFYD-175 出现就硬跳过。
+
+链接优先用 `av_ed2k`，否则 magnet。写到 mode 600 的临时文件，用 `URI=$(cat file)` 和 `--url "$URI"` 交给提交，然后删掉。标准输出、ssh 命令行和 `progress.json` 都不打印链接。两次交磁间隔约 48 秒。115 返回 406 时退避约 180 秒。出现验证码、911、风控或账号异常时，写下 `library-scan/BLOCKED` 并停止新交磁，已经有文件的番号继续抽帧。离线配额剩余少于 5，或 115 云盘剩余低于 20GiB，也停止新交磁。本地 cache 和 `/media` 要分别看：只有对应文件系统可用空间低于 1GiB 才说磁盘满。cache 上百 GiB、115 云盘还有上万 GiB，都不是磁盘满。下载落在 115，不落在 cache。
+
+正在下载或卡住的番号（进度长时间不动、速率为 0）记入 `in_progress` / `stuck`，然后处理后面的番号，之后再看。进度在容器 `/config/scripts/av-auto-fs/library-scan/progress.json`（宿主机 `/mnt/user/appdata/moviepilot/config/scripts/av-auto-fs/library-scan/progress.json`），包含 queue、done、failed、skipped_no_link、stuck、costs、current。中断后执行同一条命令即可恢复。不读取、也不依赖 `run/av-auto-506` 里的 verify5-pause。
+
+```bash
+/home/yuanhao/av-review/bin/av_auto library-scan --dry-run
+/home/yuanhao/av-review/bin/av_auto library-scan --status
+```
+
+`--dry-run` 和 `--status` 只报告 total、with_link、already_reviewed、skip、no_link、remaining，不交磁、不抽帧。
 
 约束：用 p115client，不用 CloudDrive2；不改 media_llm_route；不刮削。验证条不要自动 promote。
