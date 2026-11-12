@@ -7,11 +7,20 @@ Never print cookies/tokens. Do not change media_llm_route.
 Flow for intake: p115client submit into /av-auto/_staging/<code>/ → wait offline
 → junk-clean (keep feature videos only, move into /av-auto/<code>/, delete leftovers)
 → write strm only for keepers → dense-frame from those strm.
-Promote is explicit and never automatic.
+Promote is explicit unless the auto-promote switch is on. The switch is off
+until the operator creates /config/scripts/av-auto-fs/auto_promote.on (or sets
+AV_AUTO_AUTO_PROMOTE=1). It is read again for every title, so turning it on
+does not require stopping a batch that is already running.
 
-After offline is already finished, `process` is the only end-to-end entry:
+After offline is already finished, `process` is the post-offline entry:
 clean → strm → frames → dual-model review → grok-review when uncertain or split.
-It does not submit, scrape, or promote. A catalog code is never a subcommand.
+It does not submit or scrape. With the switch on, a pass (dual-model agree/pass,
+or a Grok tiebreak whose kept_verdict is pass) runs the official promote path.
+A catalog code is never a subcommand.
+
+`library-scan` is the full findav library runner. It may submit into staging,
+then uses `process` or `frames --strm` + review. It never scrapes. Promote
+happens only when that `process` sees the auto-promote switch on.
 Completed frames, review.json, and any grok_review.json are written to
 /config/scripts/av-auto-fs/frames/<code>/ before the run reports success.
 A container /tmp/av-auto-frames copy alone is not success.
@@ -111,7 +120,13 @@ PRECHECK_RETRIES = 3      # plus the first attempt
 LLM_RUNTIME = Path("/config/scripts/av-auto-fs/llm_runtime.json")
 # Host bind: /mnt/user/appdata/moviepilot/config/scripts/av-auto-fs/frames/
 OFFICIAL_FRAMES_ROOT = Path("/config/scripts/av-auto-fs/frames")
+# Empty file, or the text on/1/true/yes, turns auto-promote on. off/0/false/no turns it off.
+# Host path: /mnt/user/appdata/moviepilot/config/scripts/av-auto-fs/auto_promote.on
+AUTO_PROMOTE_SWITCH = Path("/config/scripts/av-auto-fs/auto_promote.on")
 TMP_FRAMES_ROOT = Path("/tmp/av-auto-frames")
+_PROMOTE_HELD = False
+_PROMOTE_ON = {"", "1", "true", "yes", "on"}
+_PROMOTE_OFF = {"0", "false", "no", "off"}
 _PERSIST_JSON = {"frames_manifest.json", "review.json", "grok_review.json", "probe.json"}
 MAGPIE_DEFAULT = "http://192.168.1.9:3430"
 PRECHECK_MODEL = "deepseek/deepseek-flash"
@@ -145,15 +160,32 @@ PRECHECK_SYSTEM = (
 )
 
 REVIEW_SYSTEM = (
-    "你是影视库筛选助手。用户偏好：身材要好、不要干扁；不要显老，要年轻、皮肤白、水嫩；"
-    "预览不要狰狞表情（「色不是难受」）。色情题材、裸露、性行为本身不判负。"
-    "只根据所附抽帧里女优的可见外观判断，不要因为片名、类型标签（如人妻、熟女）本身判负。"
-    "判定维度仅限：dry_thin（身材干扁）、looks_old（显老）、poor_skin（皮肤差/暗沉、明显不白不水嫩）、"
-    "grimace（狰狞或难受表情，含看起来痛苦的夸张白目/失神）。"
-    "スレンダー不要单独判成干扁；人妻/熟女/老片/蜜色不单独判负。"
+    "你是影视库筛选助手。只根据所附抽帧里女优的可见外观判断，不要因为片名或类型标签（人妻、熟女、凌辱、强奸、SM）本身判负。"
+    "色情题材、裸露、性行为本身不判负。スレンダー不要单独判成干扁；人妻/熟女/老片/蜜色不单独判负。"
+    "用户口味可以否决「看起来还行」：皮肤白、年轻感、身材有曲线，或观感上的高颜值，都不能抵消任一较明确的命中。"
+    "判定维度仅限："
+    "dry_thin（身材干扁：瘦到没肉。纤细有曲线不算）、"
+    "looks_old（显老：看起来比应有的年轻感老，面部松弛、纹路或气色显年纪。标签不算；画面里确实显老就要打。皮肤白或身材丰满不能抵消）、"
+    "poor_skin（皮肤差：暗沉，明显不白、不水嫩）、"
+    "not_pretty（不漂亮：按用户个人口味脸不好看、缺乏吸引力。年轻、皮肤白、身材不干扁、表情正常，仍然可以因为不好看单独 fail。"
+    "不要把「挑不出干扁/显老/皮肤差/狰狞」当成 pass。已经明显好看、有吸引力的不要打）、"
+    "soft_chest（胸部不够挺拔：下垂、软塌、不够立。丰满或罩杯大不等于挺拔，不能用「不干扁」抵消。挺的、只是大的，不要打）、"
+    "implants（假胸：明显隆胸或假体，轮廓僵硬、圆形不自然、上缘鼓包，一看就是假。自然的大胸和挺拔的真胸不要打。看不准是不是假体就不要打）、"
+    "grimace（狰狞：只有明显痛苦、难看、像在受苦的表情，见下）。"
+    "「色不是难受」只指明显痛苦狰狞，不指色情高潮或 SM/调教里的用力脸。"
+    "grimace 先分两种脸。"
+    "色情用力脸：皱眉、露齿、眯眼、张嘴、眉眼紧绷、嘴微张、闭眼、轻微失神或白眼。"
+    "出现在性行为、捆绑、拘束、SM、调教、强制高潮里时，视为色，不打 grimace，不要 fail。"
+    "单帧或末段近景的紧皱露齿、眯眼张嘴、眉眼紧蹙嘴微张，不够。"
+    "痛苦狰狞脸：多帧都是夸张的痛苦皱眉张口，或五官痛到扭曲、哭喊；单独一帧已经明显是受苦而不是高潮，也要打 grimace 并 fail。"
+    "不要把这种脸改口说成快感。"
+    "不要因为题材是 SM 就把用力脸打成狰狞，也不要因为题材是凌辱或强奸就把已经明显痛苦的脸放过。"
     "只输出一个 JSON 对象，不要 Markdown，不要其它文字。字段："
     '{"verdict":"pass|fail|uncertain","hits":[],"reason":"一句短理由","confidence":"high|mid|low"}。'
-    "verdict=fail：至少一项维度在图中较明确；pass：未见明显不符；uncertain：看不清、角度限制或证据冲突。"
+    "hits 只能用上述英文维度名，可多项。"
+    "verdict=fail：至少一项在图中较明确，包括不漂亮、显老、胸部不够挺拔、假胸，或符合上面口径的狰狞。高颜值观感不能改成 pass。"
+    "pass：这些维度都未见明显不符。"
+    "uncertain：看不清、角度限制或证据冲突。"
     "只使用有效抽帧；不要根据无效空景或纯字幕想象内容。"
 )
 
@@ -811,19 +843,78 @@ def _videos_in(pan, folder_id: str, min_bytes: int | None = None) -> list[dict]:
     return videos
 
 
-def _write_strm_dir(dest: Path, play_base: str, build_play_url, safe_name, videos: list[dict], code: str) -> list[Path]:
+def _library_files_present(dest: Path) -> bool:
+    """True when this strm folder already belongs to an official title."""
+    try:
+        if not dest.exists():
+            return False
+        children = list(dest.iterdir())
+    except OSError:
+        return False
+    for path in children:
+        if not path.is_file():
+            continue
+        if path.suffix.lower() == ".strm" or path.name.lower() == "movie.nfo":
+            return True
+    return False
+
+
+def _strm_destination(
+    dest: Path,
+    code: str,
+    fname: str,
+    safe_name,
+    *,
+    single_fresh: bool,
+    protect_existing: bool,
+) -> Path | None:
+    """Pick a strm path. protect_existing never replaces a file that is already there."""
+    code_name = f"{safe_name(code)}.strm"
+    stem = safe_name(Path(fname).stem) or safe_name(code)
+    stem_name = f"{stem}.strm"
+    file_name = f"{safe_name(fname)}.strm"
+    if single_fresh:
+        return dest / code_name
+    preferred = dest / stem_name
+    if not protect_existing or not preferred.exists():
+        return preferred
+    alt = dest / file_name
+    if alt != preferred and not alt.exists():
+        return alt
+    return None
+
+
+def _write_strm_dir(
+    dest: Path,
+    play_base: str,
+    build_play_url,
+    safe_name,
+    videos: list[dict],
+    code: str,
+    *,
+    protect_existing: bool = False,
+) -> list[Path]:
     media_mkdir(dest)
     written = []
+    single_fresh = len(videos) == 1 and not protect_existing
     for vid in videos:
         pc = vid.get("pickcode") or ""
         if not pc:
             print(f"WARN: {vid['name']} 无 pickcode，跳过 strm")
             continue
         fname = vid["name"]
+        path = _strm_destination(
+            dest,
+            code,
+            fname,
+            safe_name,
+            single_fresh=single_fresh,
+            protect_existing=protect_existing,
+        )
+        if path is None:
+            print(f"WARN: {code} 已有 strm 对应 {fname}，不覆盖")
+            continue
         url = build_play_url(play_base, pc, fname)
-        # single-file folders use <code>.strm to match official Av115 style
-        stem = safe_name(code if len(videos) == 1 else Path(fname).stem)
-        path = dest / f"{stem}.strm"
         media_write_text(path, url.strip() + "\n")
         written.append(path)
     return written
@@ -1758,7 +1849,7 @@ def cmd_review(args) -> int:
     failed_models = [m for m in llm["review_models"] if not models[m].get("ok")]
     vs = [models[m]["verdict"] for m in llm["review_models"]]
     if failed_models:
-        # 调用失败不是「两家一致 uncertain」：明确标成 incomplete，便于重跑。
+        # 调用失败不是 "两家一致 uncertain"：明确标成 incomplete，便于重跑。
         agreement = "incomplete"
         consensus = "uncertain"
     elif vs and all(v == vs[0] for v in vs):
@@ -1789,7 +1880,7 @@ def cmd_review(args) -> int:
     dest = out / "review.json"
     dest.write_text(json.dumps(result, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")
     if failed_models:
-        # 保留失败现场供排查，但不当作已完成；返回非 0 让调用方重试。
+        # 保留失败现场供排查，但不当作已完成；返回非 0 让 process/library-scan 重试。
         _persist_frames_dir(code, out)
         print(
             f"FAIL review {code}: {len(failed_models)}/{len(llm['review_models'])} 个模型调用失败 "
@@ -1814,7 +1905,7 @@ def cmd_review(args) -> int:
                 if child.is_file() and child.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
                     child.unlink()
             print("已清理临时帧（保留 frames_manifest.json 与 review.json）")
-    return 0
+    return _auto_promote_standalone(code, out, result, allow_tiebreak=False) or 0
 
 
 def _model_short(model: str) -> str:
@@ -1890,6 +1981,39 @@ def tiebreak_trigger(review: dict) -> str:
 def review_needs_tiebreak(review: dict) -> bool:
     """True when a dual-model review is uncertain or the two models disagree."""
     return tiebreak_trigger(review) != ""
+
+
+def kept_verdict_of(grok: dict | None) -> str:
+    """kept_verdict from grok_review.json, preferring the tiebreak object."""
+    if not isinstance(grok, dict):
+        return ""
+    tie = grok.get("tiebreak")
+    if isinstance(tie, dict) and tie.get("kept_verdict") in _VERDICTS:
+        return str(tie.get("kept_verdict"))
+    if grok.get("kept_verdict") in _VERDICTS:
+        return str(grok.get("kept_verdict"))
+    return ""
+
+
+def review_passed(review: dict | None, grok: dict | None = None) -> bool:
+    """True only for a promote-worthy pass.
+
+    agree + consensus pass wins even if an older grok_review.json says fail.
+    agree + consensus fail never promotes, even if that file says pass.
+    disagree, partial, or any other unsettled dual result promotes only when
+    Grok's kept_verdict is pass.
+    """
+    if not isinstance(review, dict):
+        return False
+    agreement = str(review.get("agreement") or "")
+    consensus = str(review.get("consensus") or "")
+    if agreement == "agree" and consensus == "pass":
+        return True
+    if agreement == "agree" and consensus == "fail":
+        return False
+    if agreement in {"disagree", "partial"} or consensus != "pass":
+        return kept_verdict_of(grok) == "pass"
+    return False
 
 
 def decide_tiebreak(prior: dict[str, str], grok_verdict: str) -> dict:
@@ -2124,7 +2248,8 @@ def cmd_grok_review(args) -> int:
     """Tiebreak one existing dual-model review with cursor/grok-4.7.
 
     Does not rerun DeepSeek or gpt-6-luna, does not change media_llm_route.json,
-    does not overwrite review.json, and does not promote.
+    and does not overwrite review.json. Promote runs only when the auto-promote
+    switch is on and the kept verdict is pass.
     """
     code, out, dir_rc = _grok_frames_dir(args)
     if dir_rc != 0:
@@ -2150,7 +2275,7 @@ def cmd_grok_review(args) -> int:
         if (out / "grok_review.json").is_file():
             stale = " 已有 grok_review.json 未改动，以这次一致结论为准。"
         print(f"tiebreak SKIP {agreement}/{consensus}  两家已有明确一致结论，不调用 Grok，不写 grok_review.json。{stale}")
-        return 0
+        return _auto_promote_standalone(code, out, review, allow_tiebreak=True) or 0
     manifest_path = out / "frames_manifest.json"
     if not manifest_path.is_file():
         _die(f"找不到 {manifest_path}，无法确认有效帧。请使用 av_auto frames 预检后的目录。")
@@ -2193,7 +2318,7 @@ def cmd_grok_review(args) -> int:
     if review_path.read_bytes() != before:
         _die("review.json 被改动")
     if grok.get("ok") is not True:
-        # 失败尝试留档，但不落成完成态；下次 process 会重跑。
+        # 失败尝试留档，但不落成完成态，也不 promote；下次 process 会重跑。
         _persist_frames_dir(code, out)
         print(
             f"FAIL grok-review {code}: Grok 调用/解析失败（http={grok.get('http')}），不计为已完成",
@@ -2209,7 +2334,7 @@ def cmd_grok_review(args) -> int:
     print(f"  {GROK_TIEBREAK_MODEL}: {grok['verdict']} {grok['confidence']} {grok['reason']}".rstrip())
     print(f"tiebreak {tag} {doc['tiebreak']['kept_verdict']}  {doc['tiebreak']['conclusion']}")
     print(f"→ {official_grok}")
-    return 0
+    return _auto_promote_standalone(code, out, review, allow_tiebreak=True) or 0
 
 
 def _emby_refresh(paths: dict, dest: Path) -> str:
@@ -2252,95 +2377,599 @@ def _emby_refresh(paths: dict, dest: Path) -> str:
     return "; ".join(notes)
 
 
+def _promote_timing() -> tuple[float, float]:
+    """Parent-listing budget after files/move. Not read from a cached dir_id."""
+    def _num(name: str, default: float) -> float:
+        raw = (os.environ.get(name) or "").strip()
+        try:
+            value = float(raw)
+        except ValueError:
+            return default
+        if value < 0:
+            return default
+        return value
+
+    return _num("AV_AUTO_PROMOTE_VERIFY_SEC", 20.0), _num("AV_AUTO_PROMOTE_VERIFY_INTERVAL", 0.4)
+
+
+def _real_attr(obj, name: str):
+    """getattr that does not invent attributes on unittest mocks."""
+    if obj is None:
+        return None
+    if type(obj).__module__.startswith("unittest.mock"):
+        data = getattr(obj, "__dict__", None)
+        if isinstance(data, dict) and name in data:
+            return data[name]
+        return None
+    return getattr(obj, name, None)
+
+
+def _refresh_pan(pan) -> None:
+    """Drop in-process path caches. 115 path getid is not a move receipt."""
+    for name in ("refresh", "invalidate", "cache_clear", "clear_cache"):
+        fn = _real_attr(pan, name)
+        if not callable(fn):
+            continue
+        try:
+            fn()
+        except TypeError:
+            try:
+                fn(True)
+            except Exception:
+                pass
+        except Exception:
+            pass
+    for attr in ("_cache", "_ids", "_dir_ids", "_path_ids", "id_to_dirnode", "_path_cache"):
+        obj = _real_attr(pan, attr)
+        if isinstance(obj, dict):
+            obj.clear()
+
+
+def _normalize_pan_item(item: dict) -> dict:
+    """One listing row. Falls back if the MoviePilot plugin is not importable."""
+    empty = {"name": "", "id": "", "is_dir": False, "size": 0, "pickcode": ""}
+    if not isinstance(item, dict):
+        return empty
+    name = ""
+    fid = ""
+    is_dir = False
+    size = 0
+    try:
+        api = _load_av115_api()
+
+        name = str(api.item_name(item) or "")
+        fid = str(api.item_id(item) or "")
+        is_dir = bool(api.item_is_dir(item))
+        size = int(api.item_size(item) or 0)
+    except Exception:
+        name = str(item.get("n") or item.get("name") or item.get("fn") or "")
+        cid = str(item.get("cid") or item.get("category_id") or "")
+        fid = str(item.get("fid") or item.get("file_id") or item.get("id") or "")
+        fc = item.get("fc")
+        if item.get("is_dir") is True or str(fc) == "0" or fid in {"", "0", "None"}:
+            is_dir = True
+            fid = cid or ("" if fid in {"0", "None"} else fid)
+        else:
+            is_dir = False
+        try:
+            size = int(item.get("s") or item.get("size") or item.get("fs") or 0)
+        except (TypeError, ValueError):
+            size = 0
+    pickcode = str(item.get("pc") or item.get("pickcode") or item.get("pick_code") or "")
+    if fid in {"None", "0"}:
+        fid = ""
+    return {"name": name, "id": fid, "is_dir": is_dir, "size": size, "pickcode": pickcode}
+
+
+def _list_items(pan, folder_id: str) -> list[dict]:
+    if not _id_ok(folder_id):
+        return []
+    _refresh_pan(pan)
+    out = []
+    for item in pan.list_children(folder_id):
+        rec = _normalize_pan_item(item)
+        if rec["name"] or rec["id"]:
+            out.append(rec)
+    return out
+
+
+def _iter_files(pan, folder_id: str) -> list[dict]:
+    """Non-directory files under folder_id. Each row includes parent id."""
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    def walk(fid: str) -> None:
+        if not _id_ok(fid) or fid in seen:
+            return
+        seen.add(fid)
+        for item in _list_items(pan, fid):
+            if item["is_dir"] and item["id"] and item["id"] != fid:
+                walk(item["id"])
+            elif not item["is_dir"] and item["id"]:
+                rec = dict(item)
+                rec["parent"] = fid
+                out.append(rec)
+
+    walk(str(folder_id))
+    return out
+
+
+def _child_dir_id(pan, parent_id: str, name: str) -> str:
+    wanted = (name or "").casefold()
+    if not wanted:
+        return ""
+    for item in _list_items(pan, parent_id):
+        if item["is_dir"] and item["name"].casefold() == wanted and _id_ok(item["id"]):
+            return item["id"]
+    return ""
+
+
+def _move_accepted(result) -> bool:
+    if result is None or result is True:
+        return True
+    if result is False or result == 0:
+        return False
+    if isinstance(result, dict):
+        state = result.get("state", result.get("success"))
+        if state is False or state == 0:
+            return False
+        errno = result.get("errno", result.get("errcode", result.get("error_code", result.get("errNo"))))
+        if errno not in (None, 0, "0", ""):
+            return False
+        if state is None and errno is None and result.get("error"):
+            return False
+    return True
+
+
+def _move_id(pan, fid: str, parent: str) -> None:
+    try:
+        result = pan.move(fid, parent)
+    except Exception as exc:
+        raise RuntimeError(_redact_media(str(exc))[:180]) from None
+    if not _move_accepted(result):
+        raise RuntimeError("115 拒绝移动")
+
+
+def _poll_until(predicate) -> bool:
+    timeout, interval = _promote_timing()
+    deadline = time.monotonic() + timeout
+    while True:
+        if predicate():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval if interval > 0 else 0.01)
+
+
+def _dirs_under(pan, parent_id: str, folder_id: str, name: str) -> tuple[str, list[str]]:
+    """(our folder id if listed, other directories with the same name).
+
+    Id match wins. A same-name directory with a different id is not ours:
+    rolling that id back would take the existing official title out of /AV.
+    """
+    wanted = (name or "").casefold()
+    own = ""
+    others: list[str] = []
+    for item in _list_items(pan, parent_id):
+        if not item["is_dir"] or not _id_ok(item["id"]):
+            continue
+        if _id_ok(folder_id) and item["id"] == str(folder_id):
+            own = item["id"]
+        elif wanted and item["name"].casefold() == wanted:
+            others.append(item["id"])
+    return own, others
+
+
+def _folder_landed(pan, parent_id: str, folder_id: str, name: str) -> str:
+    """Id of folder_id if the parent lists it, else one same-name directory."""
+    own, others = _dirs_under(pan, parent_id, folder_id, name)
+    if own:
+        return own
+    if len(others) == 1:
+        return others[0]
+    return ""
+
+
+def _ids_in_folder(pan, folder_id: str, file_ids: list[str]) -> bool:
+    have = {item["id"] for item in _list_items(pan, folder_id) if not item["is_dir"]}
+    return all(fid in have for fid in file_ids)
+
+
+def _rollback_files(pan, moved: list[dict]) -> bool:
+    ok = True
+    for item in reversed(moved):
+        try:
+            _move_id(pan, item["id"], item["parent"])
+        except Exception:
+            ok = False
+    return ok
+
+
+def _unlink_paths(paths: list[Path]) -> None:
+    for path in paths:
+        try:
+            if path.is_file():
+                path.unlink()
+        except OSError:
+            pass
+
+
+def _video_row(item: dict, min_bytes: int) -> dict | None:
+    if not _is_keeper(item["name"], int(item.get("size") or 0), min_bytes):
+        return None
+    return {
+        "name": item["name"],
+        "id": item["id"],
+        "pickcode": item.get("pickcode") or "",
+        "size": int(item.get("size") or 0),
+    }
+
+
+def _delete_empty_cloud_dir(pan, folder_id: str) -> bool:
+    client = _real_attr(pan, "client")
+    deleter = _real_attr(client, "fs_delete") if client is not None else None
+    if not callable(deleter):
+        deleter = _real_attr(pan, "delete")
+    if not callable(deleter):
+        return False
+    if client is not None and deleter is _real_attr(client, "fs_delete"):
+        deleter({"fid": str(folder_id), "ignore_warn": 1})
+    else:
+        deleter(str(folder_id))
+    return True
+
+
+def _safe_exc(exc: BaseException) -> str:
+    text = _redact_media(str(exc))
+    text = re.sub(r"(?i)\b(cookie|token|pickcode|pick_code|uid)\s*=\s*\S+", r"\1=...", text)
+    return text[:180]
+
+
 def _promote_one(pan, rest, paths, code: str, dry: bool) -> str:
-    build_play_url, destination, find_existing, safe_name, write_library = rest
+    """Move a passed staging title into /AV/<code>, or merge into that folder.
+
+    115 path lookup (dir_id / fs_dir_getid) is not a receipt. After files/move
+    the new path often still misses and the old path still hits, which used to
+    fail every title after 0.8s and then skip strm. Success is the folder id
+    or the new file ids showing up in the destination parent's own listing.
+    A same-name official file is left untouched. New files move together or
+    not at all. Staging strm stays until that receipt is in hand.
+    """
+    build_play_url, destination, find_existing, safe_name, _write_library = rest
+    code = _norm_code(code)
     src_path = f"{paths['staging_115'].rstrip('/')}/{code}"
     dst_path = f"{paths['official_115'].rstrip('/')}/{code}"
-    src_id = pan.dir_id(src_path)
-    if not _id_ok(src_id):
-        return f"FAIL {code}: 115 上没有 {src_path}，未动"
-    if _id_ok(pan.dir_id(dst_path)):
-        return f"FAIL {code}: 正式库已有 {dst_path}，整夹留在 av-auto，未搬"
-    videos = _videos_in(pan, src_id)
     official_id = pan.dir_id(paths["official_115"])
     if not _id_ok(official_id):
         return f"FAIL {code}: 正式库 {paths['official_115']} 不存在，未动"
     staging_parent = pan.dir_id(paths["staging_115"])
+    src_id = pan.dir_id(src_path)
+    dst_id = pan.dir_id(dst_path)
+    if not _id_ok(dst_id):
+        # Path index can miss a folder the parent listing already has.
+        dst_id = _child_dir_id(pan, official_id, code)
     existing = find_existing(paths["official_strm"], code)
     dest = existing or destination(paths["official_strm"], code, "")
     staging_dir = paths["staging_strm"] / safe_name(code)
-    if dry:
-        return (
-            f"DRY {code}: 将把 {src_path} → {dst_path}，"
-            f"写正式 strm {dest}（{'已有夹' if existing else '新建'}），"
-            f"然后刷新 Emby、删除 {staging_dir}；成片 {len(videos)} 个"
+    min_bytes = _min_bytes(paths)
+
+    if not _id_ok(src_id):
+        if not _id_ok(dst_id):
+            return f"FAIL {code}: 115 上没有 {src_path}，未动"
+        if dry:
+            return (
+                f"DRY {code}: 115 已在 {dst_path}（staging 夹已不在），"
+                f"将只补不存在的正式 strm {dest}，刷新 Emby，并删除 {staging_dir}；不覆盖已有 strm"
+            )
+        return _finish_already_official(
+            pan, paths, code, dst_id, dst_path, dest, staging_dir, build_play_url, safe_name, min_bytes
         )
-    if not videos:
-        return f"FAIL {code}: {src_path} 里没有成片，未搬"
 
-    # 1) 115 整夹搬家
     try:
-        pan.move(src_id, official_id)
+        src_files = _iter_files(pan, src_id)
     except Exception as exc:
-        return f"FAIL {code}: 115 搬家失败（{exc}），仍在 av-auto"
-    time.sleep(0.8)
-    if not _id_ok(pan.dir_id(dst_path)) or _id_ok(pan.dir_id(src_path)):
-        # 尝试视为失败并保持原状（若已部分过去则再试搬回）
-        if _id_ok(pan.dir_id(dst_path)) and _id_ok(staging_parent):
-            try:
-                pan.move(pan.dir_id(dst_path), staging_parent)
-            except Exception:
-                pass
-        return f"FAIL {code}: 搬家后核验失败，已尝试留在/搬回 av-auto"
-
-    # 2) 写正式 strm（失败则搬回 115）
-    def _rollback(reason: str) -> str:
+        return f"FAIL {code}: 列出 {src_path} 失败（{_safe_exc(exc)}），未搬"
+    src_videos = [row for row in (_video_row(item, min_bytes) for item in src_files) if row]
+    merging = _id_ok(dst_id)
+    occupied = set()
+    new_files: list[dict] = []
+    skipped: list[dict] = []
+    if merging:
         try:
-            now = pan.dir_id(dst_path)
-            if _id_ok(now) and _id_ok(staging_parent):
-                pan.move(now, staging_parent)
-            time.sleep(0.5)
-            back = _id_ok(pan.dir_id(src_path))
-            return f"FAIL {code}: {reason}；115 已回滚到 av-auto" if back else f"FAIL {code}: {reason}；回滚失败，片子可能已在 {dst_path}，staging strm 保留"
+            occupied = {item["name"].casefold() for item in _iter_files(pan, dst_id)}
         except Exception as exc:
-            return f"FAIL {code}: {reason}；回滚异常（{exc}），片子可能已在 {dst_path}，staging strm 保留"
+            return f"FAIL {code}: 列出 {dst_path} 失败（{_safe_exc(exc)}），未搬"
+        for item in src_files:
+            if item["name"].casefold() in occupied:
+                skipped.append(item)
+            else:
+                new_files.append(item)
+        new_files.sort(key=lambda item: item["name"])
+    if dry:
+        if merging:
+            return (
+                f"DRY {code}: 并入已有 {dst_path}（不新建第二夹，不覆盖同名成片），"
+                f"新文件 {len(new_files)} 个，同名留下 {len(skipped)} 个，"
+                f"写正式 strm {dest}（{'已有夹' if existing else '新建'}），然后刷新 Emby"
+            )
+        return (
+            f"DRY {code}: 将把 {src_path} → {dst_path}（新建），"
+            f"写正式 strm {dest}（{'已有夹' if existing else '新建'}），"
+            f"然后刷新 Emby、删除 {staging_dir}；成片 {len(src_videos)} 个"
+        )
+    if not src_videos and not new_files:
+        return f"FAIL {code}: {src_path} 里没有成片，未搬"
+    if merging and not new_files:
+        return (
+            f"SKIP {code}: {dst_path} 已有同名文件，未覆盖、未新建第二夹，整夹留在 av-auto"
+        )
+    if merging and not _id_ok(staging_parent):
+        return f"FAIL {code}: 找不到 {paths['staging_115']}，未搬"
 
+    if not merging:
+        return _promote_fresh_folder(
+            pan, paths, code, src_id, src_path, dst_path, official_id, staging_parent,
+            src_videos, dest, staging_dir, build_play_url, safe_name, existing,
+        )
+    return _promote_merge(
+        pan, paths, code, src_id, src_path, dst_id, dst_path, staging_parent,
+        new_files, skipped, dest, staging_dir, build_play_url, safe_name, min_bytes,
+    )
+
+
+def _finish_streams(
+    paths,
+    dest: Path,
+    code: str,
+    videos: list[dict],
+    build_play_url,
+    safe_name,
+    *,
+    protect_existing: bool,
+) -> tuple[list[Path], str]:
+    written = _write_strm_dir(
+        dest,
+        paths["play_base"],
+        build_play_url,
+        safe_name,
+        videos,
+        code,
+        protect_existing=protect_existing,
+    )
+    if len(written) < len(videos):
+        _unlink_paths(written)
+        return [], "未能写正式 strm（缺 pickcode 或同名 strm 不能覆盖）"
+    return written, ""
+
+
+def _note_emby(paths, dest: Path) -> str:
     try:
-        moved_videos = _videos_in(pan, pan.dir_id(dst_path))
-        if not moved_videos:
-            return _rollback("搬家后正式夹里看不到成片")
-        media_mkdir(dest)
-        written = _write_strm_dir(dest, paths["play_base"], build_play_url, safe_name, moved_videos, code)
-        if not written:
-            return _rollback("未能写正式 strm（缺 pickcode）")
+        return _emby_refresh(paths, dest)
     except Exception as exc:
-        return _rollback(f"写正式 strm 失败（{exc}）")
+        return f"Emby 刷新失败（{_safe_exc(exc)}），正式 strm 已写好，可稍后手动刷新"
 
-    # 3) Emby 刷新（失败不回滚片子：正式 strm 已就绪，刷新可后补）
-    emby_note = ""
-    try:
-        emby_note = _emby_refresh(paths, dest)
-    except Exception as exc:
-        emby_note = f"Emby 刷新失败（{exc}），正式 strm 已写好，可稍后手动刷新"
 
-    # 4) 清 staging strm（仅在 115 已不在 av-auto 且正式 strm 写好之后）
+def _drop_staging_strm(staging_dir: Path) -> None:
     if staging_dir.is_dir() or _is_media_path(staging_dir):
         media_rmtree(staging_dir)
+
+
+def _finish_already_official(
+    pan, paths, code, dst_id, dst_path, dest, staging_dir, build_play_url, safe_name, min_bytes
+) -> str:
+    """Staging folder is already gone and /AV/<code> is there.
+
+    Completes strm for a move whose path check false-failed. Does not move,
+    does not replace an existing strm, and does not submit the title again.
+    """
+    videos = [row for row in (_video_row(item, min_bytes) for item in _iter_files(pan, dst_id)) if row]
+    if not videos:
+        return f"FAIL {code}: {dst_path} 里没有成片，staging strm 保留，未动"
+    protect = True
+    try:
+        written, err = _finish_streams(
+            paths, dest, code, _videos_missing_strm(dest, videos, safe_name),
+            build_play_url, safe_name, protect_existing=protect,
+        )
+    except Exception as exc:
+        return f"FAIL {code}: 补正式 strm 失败（{_safe_exc(exc)}），staging strm 保留"
+    if err and _videos_missing_strm(dest, videos, safe_name):
+        return f"FAIL {code}: {err}，staging strm 保留"
+    emby_note = _note_emby(paths, dest)
+    _drop_staging_strm(staging_dir)
+    extra = f"补 strm {len(written)} 个" if written else "正式 strm 已在，未覆盖"
+    return f"OK {code}: 115 已在 {dst_path}，未再搬家；{extra}；strm {dest}；{emby_note}"
+
+
+def _videos_missing_strm(dest: Path, videos: list[dict], safe_name) -> list[dict]:
+    """Videos that do not already have a strm. An existing stem strm is left alone."""
+    pending = []
+    for vid in videos:
+        stem = safe_name(Path(vid["name"]).stem) or safe_name(vid["name"])
+        if (dest / f"{stem}.strm").exists():
+            continue
+        if (dest / f"{safe_name(vid['name'])}.strm").exists():
+            continue
+        pending.append(vid)
+    return pending
+
+
+def _file_names(dest: Path) -> set[str]:
+    try:
+        if not dest.exists():
+            return set()
+        return {path.name for path in dest.iterdir() if path.is_file()}
+    except OSError:
+        return set()
+
+
+def _remove_new_strm(dest: Path, before: set[str]) -> None:
+    try:
+        if not dest.exists():
+            return
+        for path in list(dest.iterdir()):
+            if path.is_file() and path.name not in before and path.suffix.lower() == ".strm":
+                path.unlink()
+    except OSError:
+        pass
+
+
+def _move_folder_back(pan, official_id: str, src_id: str, staging_parent: str, code: str) -> bool:
+    """Move only our folder id back. Never touch a different same-name directory."""
+    if not _id_ok(staging_parent):
+        return False
+    own, _others = _dirs_under(pan, official_id, src_id, code)
+    if not own:
+        return False
+    try:
+        _move_id(pan, own, staging_parent)
+    except Exception:
+        return False
+    return _poll_until(lambda: bool(_dirs_under(pan, staging_parent, src_id, code)[0]))
+
+
+def _promote_fresh_folder(
+    pan, paths, code, src_id, src_path, dst_path, official_id, staging_parent,
+    src_videos, dest, staging_dir, build_play_url, safe_name, _existing,
+) -> str:
+    _own, others = _dirs_under(pan, official_id, src_id, code)
+    if others:
+        return f"FAIL {code}: 正式库父目录里已有同名夹，未整夹搬，避免第二夹"
+    try:
+        _move_id(pan, src_id, official_id)
+    except Exception as exc:
+        return f"FAIL {code}: 115 搬家失败（{_safe_exc(exc)}），仍在 av-auto"
+
+    def landed() -> bool:
+        own, extra = _dirs_under(pan, official_id, src_id, code)
+        if extra:
+            # Our id beside another same-name directory would be a second folder.
+            return False
+        if own:
+            # Folder id is stable across files/move. Path getid may still be stale.
+            return True
+        return False
+
+    if not _poll_until(landed):
+        own, extra = _dirs_under(pan, official_id, src_id, code)
+        if own and not extra:
+            pass
+        elif own and extra:
+            rolled = _move_folder_back(pan, official_id, src_id, staging_parent, code)
+            if rolled:
+                return (
+                    f"FAIL {code}: 正式库出现第二夹，已把 staging 夹搬回 av-auto，staging strm 保留"
+                )
+            return f"FAIL {code}: 正式库出现第二夹，回滚失败，staging strm 保留"
+        else:
+            # Do not move a different same-name directory. It may already be the library copy.
+            return f"FAIL {code}: 搬家未在正式库落地，片子仍在 av-auto，staging strm 保留"
+
+    own, extra = _dirs_under(pan, official_id, src_id, code)
+    if extra:
+        if own:
+            _move_folder_back(pan, official_id, src_id, staging_parent, code)
+        return f"FAIL {code}: 正式库出现第二夹，未写 strm，staging strm 保留"
+    protect = _library_files_present(Path(dest))
+    before_names = _file_names(Path(dest))
+    err = ""
+    try:
+        _written, err = _finish_streams(
+            paths, dest, code, src_videos, build_play_url, safe_name, protect_existing=protect,
+        )
+    except Exception as exc:
+        err = f"写正式 strm 失败（{_safe_exc(exc)}）"
+    if err:
+        _remove_new_strm(Path(dest), before_names)
+        rolled = _move_folder_back(pan, official_id, src_id, staging_parent, code)
+        if rolled:
+            return f"FAIL {code}: {err}；115 已回滚到 av-auto，staging strm 保留"
+        return f"FAIL {code}: {err}；回滚失败，片子可能已在 {dst_path}，staging strm 保留"
+
+    emby_note = _note_emby(paths, dest)
+    _drop_staging_strm(staging_dir)
     return f"OK {code}: {src_path} → {dst_path}；strm {dest}；{emby_note}"
+
+
+def _promote_merge(
+    pan, paths, code, src_id, src_path, dst_id, dst_path, _staging_parent,
+    new_files, skipped, dest, staging_dir, build_play_url, safe_name, min_bytes,
+) -> str:
+    # Move file ids into the existing folder. Moving the staging directory
+    # itself makes 115 refuse or create /AV/<code>(1), a second official dir.
+    moved: list[dict] = []
+    try:
+        for item in new_files:
+            _move_id(pan, item["id"], dst_id)
+            moved.append(item)
+    except Exception as exc:
+        back = _rollback_files(pan, moved)
+        where = "已搬回 av-auto" if back else "回滚失败，请核对正式库后重试"
+        return f"FAIL {code}: 并入中断（{_safe_exc(exc)}），{where}，staging strm 保留"
+    wanted = [item["id"] for item in moved]
+    if wanted and not _poll_until(lambda: _ids_in_folder(pan, dst_id, wanted)):
+        back = _rollback_files(pan, moved)
+        where = "已搬回 av-auto" if back else "回滚失败，请核对正式库后重试"
+        return f"FAIL {code}: 新文件未在 {dst_path} 确认，{where}，staging strm 保留"
+
+    new_videos = [row for row in (_video_row(item, min_bytes) for item in moved) if row]
+    if new_videos:
+        before_names = _file_names(Path(dest))
+        err = ""
+        try:
+            _written, err = _finish_streams(
+                paths, dest, code, new_videos, build_play_url, safe_name, protect_existing=True,
+            )
+        except Exception as exc:
+            err = f"写正式 strm 失败（{_safe_exc(exc)}）"
+        if err:
+            _remove_new_strm(Path(dest), before_names)
+            back = _rollback_files(pan, moved)
+            where = "已搬回 av-auto" if back else "回滚失败，请核对正式库后重试"
+            return f"FAIL {code}: {err}；{where}，staging strm 保留"
+
+    emby_note = _note_emby(paths, dest)
+    left = _iter_files(pan, src_id)
+    if left:
+        kept = "同名文件留在 av-auto，staging strm 保留"
+    else:
+        _drop_staging_strm(staging_dir)
+        try:
+            _delete_empty_cloud_dir(pan, src_id)
+        except Exception:
+            pass
+        kept = "staging strm 已删"
+    skip_note = f"同名未覆盖 {len(skipped)} 个" if skipped else "无同名冲突"
+    return (
+        f"OK {code}: 并入 {src_path} → {dst_path}（未新建第二夹）；"
+        f"新文件 {len(moved)} 个，{skip_note}；strm {dest}；{kept}；{emby_note}"
+    )
+
+
+_LAST_PROMOTE_LINES: list[str] = []
+
+
+def _promote_codes(codes: list[str], dry: bool) -> tuple[int, list[str]]:
+    global _LAST_PROMOTE_LINES
+    pan, rest = _pan()
+    paths = _paths()
+    rc = 0
+    lines: list[str] = []
+    for code in codes:
+        line = _promote_one(pan, rest, paths, code, dry)
+        print(line)
+        lines.append(line)
+        if str(line).startswith("FAIL"):
+            rc = 1
+    _LAST_PROMOTE_LINES = lines
+    return rc, lines
 
 
 def cmd_promote(args) -> int:
     codes = [_norm_code(c) for c in (args.codes or [])]
     if not codes:
         _die("用法: av_auto promote [--dry-run] 番号 [番号...]")
-    pan, rest = _pan()
-    paths = _paths()
-    rc = 0
-    for code in codes:
-        line = _promote_one(pan, rest, paths, code, bool(args.dry_run))
-        print(line)
-        if line.startswith("FAIL"):
-            rc = 1
+    rc, _lines = _promote_codes(codes, bool(args.dry_run))
     return rc
 
 
@@ -2428,9 +3057,10 @@ def _redact_result(obj) -> str:
     return _redact_media(text)[:500]
 
 
-def cmd_submit(args) -> int:
-    code = _norm_code(args.code)
-    url = (args.url or "").strip()
+def perform_submit(code: str, url: str) -> dict:
+    """Submit into /av-auto/_staging/<code>/. Does not print the URI."""
+    code = _norm_code(code)
+    url = (url or "").strip()
     if not code or not url:
         _die("用法: av_auto submit --code 番号 --url 磁链或ed2k")
     if not (url.startswith("magnet:") or url.startswith("ed2k://") or url.startswith("http")):
@@ -2445,18 +3075,36 @@ def cmd_submit(args) -> int:
     dest_id = pan.ensure_dir(dest)
     if not _id_ok(dest_id):
         _die(f"无法创建 {dest}")
-    # already have keepers in /av-auto/<code>? still allow submit for verify, but warn
     lib = f"{paths['staging_115'].rstrip('/')}/{code}"
     if _id_ok(pan.dir_id(lib)) and _videos_in(pan, pan.dir_id(lib)):
         print(f"NOTE {code}: {lib} 里已有正片，仍提交到 inbox")
     result = pan.add_magnet(url, dest_id)
     state = result.get("state") if isinstance(result, dict) else None
-    errno = result.get("errno") or result.get("error_code") or result.get("errcode")
-    print(f"SUBMIT {code} → {dest} state={state} errno={errno}")
+    errno = None
+    if isinstance(result, dict):
+        errno = result.get("errno") or result.get("error_code") or result.get("errcode")
+    failed = isinstance(result, dict) and (
+        state is False or (errno not in (None, 0, "0") and state not in (True, 1, "1"))
+    )
+    return {
+        "rc": 1 if failed else 0,
+        "result": result if isinstance(result, dict) else {"message": "non-dict"},
+        "dest": dest,
+    }
+
+
+def cmd_submit(args) -> int:
+    code = _norm_code(args.code)
+    url = (args.url or "").strip()
+    out = perform_submit(code, url)
+    result = out["result"]
+    state = result.get("state") if isinstance(result, dict) else None
+    errno = None
+    if isinstance(result, dict):
+        errno = result.get("errno") or result.get("error_code") or result.get("errcode")
+    print(f"SUBMIT {code} → {out['dest']} state={state} errno={errno}")
     print(_redact_result(result))
-    if isinstance(result, dict) and (state is False or (errno not in (None, 0, "0") and state not in (True, 1, "1"))):
-        return 1
-    return 0
+    return int(out["rc"])
 
 
 def cmd_wait(args) -> int:
@@ -2572,7 +3220,11 @@ def cmd_intake(args) -> int:
         if rc == 0 and getattr(args, "review", False):
             rc = cmd_review(argparse.Namespace(code=args.code, out=out, cleanup=cleanup))
     if rc == 0:
-        print(f"INTAKE { _norm_code(args.code) }: 完成（未 promote，未刮削）")
+        code = _norm_code(args.code)
+        if auto_promote_enabled():
+            print(f"INTAKE {code}: 完成（未刮削；自动 promote 见上方）")
+        else:
+            print(f"INTAKE {code}: 完成（未 promote，未刮削）")
     return rc
 
 
@@ -2785,9 +3437,9 @@ def _complete_review(folder: Path) -> dict | None:
     """Dual-model review.json, or None when final review still has to run.
 
     A file that exists is not proof the review ran: when the Magpie call fails,
-    cmd_review still writes rows with ok=False and verdict=uncertain. Treat
-    that (and any complete=false document) as not reviewed so a later run
-    retries instead of skipping forever.
+    cmd_review still writes the row with ok=False and verdict=uncertain. Treat
+    that (and any partial/complete=false document) as not reviewed so a later
+    run retries instead of skipping forever.
     """
     path = folder / "review.json"
     if not path.is_file():
@@ -2964,34 +3616,133 @@ def _process_grok(code: str, folder: Path, review: dict) -> int:
     return int(cmd_grok_review(argparse.Namespace(code=code, frames_dir=str(folder), out="")) or 0)
 
 
-def _process_offline_title(code: str) -> int:
+class _HoldAutoPromote:
+    """process runs review and grok itself, then promotes once at the end."""
+
+    def __enter__(self):
+        global _PROMOTE_HELD
+        self._prev = _PROMOTE_HELD
+        _PROMOTE_HELD = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        global _PROMOTE_HELD
+        _PROMOTE_HELD = self._prev
+        return False
+
+
+def _auto_promote_switch_path() -> Path:
+    raw = (os.environ.get("AV_AUTO_AUTO_PROMOTE_FILE") or "").strip()
+    return Path(raw) if raw else AUTO_PROMOTE_SWITCH
+
+
+def auto_promote_enabled() -> bool:
+    """Read the switch for this title. Do not cache it across a batch.
+
+    AV_AUTO_AUTO_PROMOTE=0/1 forces off/on for this process. Otherwise the
+    file /config/scripts/av-auto-fs/auto_promote.on is the operator switch:
+    an empty file or on/1/true/yes enables it; off/0/false/no or a missing
+    file disables it. Creating the file does not require stopping a batch
+    that shells out to av_auto per title.
+    """
+    raw = (os.environ.get("AV_AUTO_AUTO_PROMOTE") or "").strip().lower()
+    if raw in _PROMOTE_OFF:
+        return False
+    if raw in _PROMOTE_ON and raw != "":
+        return True
+    path = _auto_promote_switch_path()
+    try:
+        if not path.is_file():
+            return False
+        text = path.read_text(encoding="utf-8", errors="replace").strip().lower()
+    except OSError:
+        return False
+    return text in _PROMOTE_ON
+
+
+def _load_json_quiet(path: Path) -> dict | None:
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _run_official_promote(code: str) -> tuple[int, str]:
+    """Official promote entry. Does not submit a magnet or call the scraper."""
+    global _LAST_PROMOTE_LINES
+    _LAST_PROMOTE_LINES = []
+    rc = int(cmd_promote(argparse.Namespace(codes=[code], dry_run=False)) or 0)
+    line = _LAST_PROMOTE_LINES[-1] if _LAST_PROMOTE_LINES else ""
+    return rc, line
+
+
+def _auto_promote_standalone(
+    code: str,
+    folder,
+    review: dict | None,
+    *,
+    allow_tiebreak: bool,
+    promoted: list[str] | None = None,
+) -> int:
+    """Promote after a pass when the switch is on. Held while process is mid-pipeline."""
+    if _PROMOTE_HELD or not auto_promote_enabled():
+        return 0
+    if not isinstance(review, dict):
+        review = _load_json_quiet(Path(folder) / "review.json")
+    if not allow_tiebreak and review_needs_tiebreak(review or {}):
+        return 0
+    grok = _load_json_quiet(Path(folder) / "grok_review.json")
+    if not review_passed(review, grok):
+        print(f"SKIP promote {code}: 终审不是 pass，留在 av-auto")
+        return 0
+    print(f"AUTO promote {code}: 终审 pass，走官方 promote（不重新交磁、不刮削）")
+    try:
+        rc, line = _run_official_promote(code)
+    except Exception as exc:
+        print(f"FAIL {code}: 自动 promote 异常（{_safe_exc(exc)}），留在 av-auto")
+        return 1
+    if rc == 0 and promoted is not None and not str(line).startswith("SKIP"):
+        promoted.append(code)
+    return rc
+
+
+def _process_offline_title(code: str, promoted: list[str] | None = None) -> int:
     """clean → strm → frames → review → grok only when still unresolved.
 
-    Never submits offline, scrapes, or promotes.
+    Does not submit or scrape. Promote runs only after a pass, and only when
+    the auto-promote switch is on. The switch is read again here, after the
+    hold that keeps review/grok from promoting halfway through this title.
     """
+    switch = "不 promote" if not auto_promote_enabled() else "pass 后自动 promote"
     print(
         f"PROCESS {code}: clean → strm → frames → review → grok-review（仅 uncertain / 分歧）"
-        " → 持久帧目录；不交磁、不刮削、不 promote"
+        f" → 持久帧目录；不交磁、不刮削、{switch}"
     )
-    rc = _process_clean(code)
+    folder = None
+    review: dict | None = None
+    rc = 0
+    with _HoldAutoPromote():
+        rc = _process_clean(code)
+        if not rc:
+            rc = _process_strm(code)
+        if not rc:
+            folder, rc = _select_frames_dir(code)
+        if not rc and folder is not None:
+            rc = _process_frames(code, folder)
+        if not rc and folder is not None:
+            review, rc = _process_review(code, folder)
+        if not rc and folder is not None and review is not None:
+            rc = _process_grok(code, folder, review)
+        if not rc and folder is not None:
+            rc = _persist_frames_dir(code, folder, require_review=True)
     if rc:
         return rc
-    rc = _process_strm(code)
-    if rc:
-        return rc
-    folder, rc = _select_frames_dir(code)
-    if rc:
-        return rc
-    rc = _process_frames(code, folder)
-    if rc:
-        return rc
-    review, rc = _process_review(code, folder)
-    if rc:
-        return rc
-    rc = _process_grok(code, folder, review)
-    if rc:
-        return rc
-    return _persist_frames_dir(code, folder, require_review=True)
+    if folder is None:
+        return 1
+    return _auto_promote_standalone(
+        code, folder, review, allow_tiebreak=True, promoted=promoted,
+    )
 
 
 def cmd_process(args) -> int:
@@ -3012,9 +3763,10 @@ def cmd_process(args) -> int:
     # A stale shareFloor still leaves the jobs for the host apply_fs.
     apply_pending_queue()
     failed: list[str] = []
+    promoted: list[str] = []
     for code in codes:
         try:
-            rc = int(_process_offline_title(code) or 0)
+            rc = int(_process_offline_title(code, promoted) or 0)
         except SystemExit as exc:
             status = exc.code
             rc = status if isinstance(status, int) and status else 1
@@ -3024,13 +3776,18 @@ def cmd_process(args) -> int:
                 f"FAIL {code}: process 停在非 0（{rc}）。不交磁、不刮削、不 promote。",
                 file=sys.stderr,
             )
+        elif code in promoted:
+            print(f"PROCESS {code}: 完成（未交磁、未刮削，已 promote）")
         else:
             print(f"PROCESS {code}: 完成（未交磁、未刮削、未 promote）")
     if failed:
         print("PROCESS 未完成: " + " ".join(failed), file=sys.stderr)
         print("正确用法: av_auto process " + " ".join(codes), file=sys.stderr)
         return 1
-    print("PROCESS 全部完成: " + " ".join(codes) + "（未交磁、未刮削、未 promote）")
+    if promoted:
+        print("PROCESS 全部完成: " + " ".join(codes) + "（未交磁、未刮削）")
+    else:
+        print("PROCESS 全部完成: " + " ".join(codes) + "（未交磁、未刮削、未 promote）")
     return 0
 
 
@@ -3045,7 +3802,9 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "番号不是子命令。av_auto ABP-073 clean 会直接报错并提示正确写法。\n"
-            f"  {PROCESS_EXAMPLE}"
+            f"  {PROCESS_EXAMPLE}\n"
+            "整个 findav 库的成片抽帧（可中断后续跑，不刮削、不 promote）：\n"
+            "  av_auto library-scan"
         ),
     )
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -3109,20 +3868,26 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--out", default="")
     s.set_defaults(func=cmd_intake)
 
-    s = sub.add_parser("promote", help="整夹搬到正式 /AV/<番号>，写正式 strm，刷新 Emby，清 staging strm。默认不自动调用")
+    s = sub.add_parser(
+        "promote",
+        help="搬进 /AV/<番号>。已有夹则并入且不覆盖同名成片。核验看父目录列表，不看路径索引",
+    )
     s.add_argument("codes", nargs="+")
     s.add_argument("--dry-run", action="store_true")
     s.set_defaults(func=cmd_promote)
 
     s = sub.add_parser(
         "process",
-        help="115 已离线后：clean→strm→frames→双模型终审→仅未决时 grok-review。不交磁、不刮削、不 promote",
+        help="115 已离线后：clean→strm→frames→双模型终审→仅未决时 grok-review。不交磁、不刮削；自动 promote 默认关",
         description=(
             "处理一个或多个已经完成 115 离线的暂存番号。\n"
             "顺序固定：clean → strm → frames → review → grok-review（仅 uncertain 或两家分歧）。\n"
             "完成前把帧、review.json（以及若有的 grok_review.json）写入\n"
             "/config/scripts/av-auto-fs/frames/<番号>/。只留在容器 /tmp 不算完成。\n"
             "已完成的步骤跳过。不重新交磁，不刮削，不搬进 /AV。\n"
+            "自动 promote 默认关。打开 /config/scripts/av-auto-fs/auto_promote.on\n"
+            "（空文件或 on）后，仅 pass（两家 agree/pass，或 Grok kept_verdict=pass）\n"
+            "才走官方 promote。fail 不搬。开关每个番号重读，不用停掉正在跑的调度。\n"
             "\n"
             "用法（命令在前，番号在后）：\n"
             "  av_auto process ABP-073\n"
@@ -3132,6 +3897,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("codes", nargs="+", metavar="番号", help="一个或多个番号，必须写在 process 后面")
     s.set_defaults(func=cmd_process)
+
+    from library_scan import LIBRARY_SCAN_EXAMPLES, cmd_library_scan
+
+    s = sub.add_parser(
+        "library-scan",
+        help="整个 findav 库成片抽帧。可中断后续跑。不刮削、不 promote、不刷新 Emby",
+        description=LIBRARY_SCAN_EXAMPLES,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    s.add_argument("codes", nargs="*", metavar="番号", help="写在子命令后面。省略则扫整个 findav 库")
+    s.add_argument("--dry-run", action="store_true", help="只打印语料计数，不交磁、不抽帧、不审")
+    s.add_argument("--status", action="store_true", help="语料计数加上正在跑的进度：阶段、当前番号、完成/剩余、更新时间")
+    s.add_argument("--once", action="store_true", help="只跑一轮调度后退出。默认一直跑，再次执行同一条命令即可恢复")
+    s.set_defaults(func=cmd_library_scan)
     return p
 
 

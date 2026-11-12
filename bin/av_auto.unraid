@@ -1,0 +1,39 @@
+#!/bin/bash
+# Unraid entry: 115/抽帧在 moviepilot 里跑；/media 写入若 ENOSPC 则经 cache 落盘
+set -euo pipefail
+LLM_SRC=/mnt/user/appdata/magpie/config/magpie/caller-keys.json
+LLM_DST=/mnt/user/appdata/moviepilot/config/scripts/av-auto-fs/llm_runtime.json
+need_llm=0
+case "${1:-}" in
+  frames|review|grok-review) need_llm=1 ;;
+esac
+if [ "${1:-}" = "intake" ]; then
+  for a in "$@"; do
+    case "$a" in
+      --frames|--review) need_llm=1 ;;
+    esac
+  done
+fi
+if [ "${1:-}" = "frames" ]; then
+  skip=0
+  for a in "$@"; do
+    [ "$a" = "--no-precheck" ] && skip=1
+  done
+  need_llm=$((1-skip))
+fi
+cleanup_llm() { rm -f "$LLM_DST"; }
+if [ "$need_llm" = 1 ]; then
+  mkdir -p "$(dirname "$LLM_DST")"
+  install -m 600 "$LLM_SRC" "$LLM_DST"
+  uid=$(docker exec moviepilot id -u)
+  gid=$(docker exec moviepilot id -g)
+  chown "$uid:$gid" "$LLM_DST"
+  chmod 600 "$LLM_DST"
+  trap cleanup_llm EXIT
+fi
+set +e
+docker exec moviepilot python3 /config/scripts/av_auto.py "$@"
+rc=$?
+set -e
+/mnt/user/appdata/findav/bin/av_auto_apply_fs
+exit $rc

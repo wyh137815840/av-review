@@ -1,0 +1,37 @@
+#!/bin/bash
+# Apply queued /media writes via /mnt/cache/media (user share currently ENOSPC).
+set -euo pipefail
+PEND="/mnt/user/appdata/moviepilot/config/scripts/av-auto-fs/pending"
+[ -d "$PEND" ] || exit 0
+shopt -s nullglob
+map_cache() {
+  local p="$1"
+  p="${p%/}"
+  case "$p" in
+    /media/*) echo "/mnt/cache/media/${p#/media/}" ;;
+    /mnt/user/media/*) echo "/mnt/cache/media/${p#/mnt/user/media/}" ;;
+    *) echo "" ;;
+  esac
+}
+for job in "$PEND"/*; do
+  [ -d "$job" ] || continue
+  kind=$(cat "$job/kind")
+  srcpath=$(cat "$job/path")
+  dest=$(map_cache "$srcpath")
+  if [ -z "$dest" ]; then
+    echo "av_auto_apply_fs: skip unknown path $srcpath" >&2
+    continue
+  fi
+  case "$kind" in
+    mkdir) mkdir -p "$dest"; chown nobody:users "$dest" 2>/dev/null || true ;;
+    write_text)
+      mkdir -p "$(dirname "$dest")"
+      cat "$job/data" > "$dest"
+      chown nobody:users "$dest" 2>/dev/null || true
+      ;;
+    rmtree) rm -rf "$dest" ;;
+    *) echo "av_auto_apply_fs: unknown kind $kind" >&2 ;;
+  esac
+  rm -rf "$job"
+  echo "applied $kind $dest"
+done
