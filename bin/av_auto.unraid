@@ -2,10 +2,13 @@
 # Unraid entry: 115/抽帧在 moviepilot 里跑；/media 写入若 ENOSPC 则经 cache 落盘
 set -euo pipefail
 LLM_SRC=/mnt/user/appdata/magpie/config/magpie/caller-keys.json
-LLM_DST=/mnt/user/appdata/moviepilot/config/scripts/av-auto-fs/llm_runtime.json
+LLM_DIR=/mnt/user/appdata/moviepilot/config/scripts/av-auto-fs
+# 每次运行独立 runtime 文件，避免并发/长跑进程互相删除（library-scan 要跑数小时）。
+LLM_DST="$LLM_DIR/llm_runtime.$$.json"
+LLM_DST_IN_CONTAINER="/config/scripts/av-auto-fs/llm_runtime.$$.json"
 need_llm=0
 case "${1:-}" in
-  frames|review|grok-review) need_llm=1 ;;
+  frames|review|grok-review|process|library-scan) need_llm=1 ;;
 esac
 if [ "${1:-}" = "intake" ]; then
   for a in "$@"; do
@@ -21,6 +24,7 @@ if [ "${1:-}" = "frames" ]; then
   done
   need_llm=$((1-skip))
 fi
+DOCKER_ENV=()
 cleanup_llm() { rm -f "$LLM_DST"; }
 if [ "$need_llm" = 1 ]; then
   mkdir -p "$(dirname "$LLM_DST")"
@@ -30,9 +34,13 @@ if [ "$need_llm" = 1 ]; then
   chown "$uid:$gid" "$LLM_DST"
   chmod 600 "$LLM_DST"
   trap cleanup_llm EXIT
+  DOCKER_ENV+=(-e "AV_AUTO_LLM_FILE=$LLM_DST_IN_CONTAINER")
+fi
+if [ -n "${AV_AUTO_CORPUS_FILE:-}" ]; then
+  DOCKER_ENV+=(-e "AV_AUTO_CORPUS_FILE=$AV_AUTO_CORPUS_FILE")
 fi
 set +e
-docker exec moviepilot python3 /config/scripts/av_auto.py "$@"
+docker exec "${DOCKER_ENV[@]}" moviepilot python3 /config/scripts/av_auto.py "$@"
 rc=$?
 set -e
 /mnt/user/appdata/findav/bin/av_auto_apply_fs

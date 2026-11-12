@@ -1486,4 +1486,10 @@ def default_deps() -> ScanDeps:
 
 
 def cmd_library_scan(args) -> int:
+    # Fail fast before a ~10h inventory when the LLM runtime is missing:
+    # ready processing needs it and would otherwise fail every title at the end.
+    if not getattr(args, "status", False) and not getattr(args, "dry_run", False):
+        import av_auto
+
+        av_auto._load_llm_runtime()
     return int(execute(args) or 0)

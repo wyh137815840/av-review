@@ -135,3 +135,13 @@ curl -X POST "http://<moviepilot>:3000/api/v1/plugin/Av115Scraper/run_roots" \
 - 不修改插件配置；`/AV` 列表 60 秒缓存（move/rename/mkdir 失效），多目录扫描更快。
 - 便捷脚本（本机运维）：`python3 /workspace/ops/scan_roots.py /AV/X /AV/Y`。
 - 注意：`/run_roots` 直接走插件路径，不经过 av_auto 的 review 门；审核拦截的番号不要用它补入库。
+
+## LLM runtime 与长跑进程（2026-11-12 P0 修复）
+
+- Unraid 入口 `bin/av_auto.unraid` 现在为**每次调用使用独立的 runtime 文件**
+  （`av-auto-fs/llm_runtime.<pid>.json`，退出即删），并通过 `AV_AUTO_LLM_FILE`
+  传入容器；`process` 与 `library-scan` 也会注入 LLM runtime。
+- `library-scan` 启动时先校验 runtime（`cmd_library_scan` fail-fast），缺失立即报错，
+  不再跑完约 10 小时 inventory 后才在 ready 阶段批量失败。
+- 启动 `library-scan` 需要 corpus：`AV_AUTO_CORPUS_FILE=/config/.../corpus-<ts>.tsv`，
+  入口会把该变量传进容器；语料读取后即删除。

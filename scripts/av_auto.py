@@ -1285,7 +1285,7 @@ def _magpie_chat(cfg: dict, model: str, images: list[Path], system: str, user_te
     return _post_magpie_chat(cfg, model, images, system, user_text, timeout, max_tokens)
 
 
-def _chat_retry(cfg, model, images, system, user_text, timeout, max_tokens, tries=3) -> dict:
+def _chat_retry(cfg, model, images, system, user_text, timeout, max_tokens, tries=5) -> dict:
     last = {}
     for i in range(1, tries + 1):
         rec = _magpie_chat(cfg, model, images, system, user_text, timeout, max_tokens)
