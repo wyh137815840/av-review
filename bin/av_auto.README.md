@@ -121,3 +121,17 @@ if hook:
   `llm_runtime.json`，docker exec moviepilot 执行，退出后跑 `av_auto_apply_fs`）。
 - `bin/av_auto_apply_fs`：`/media` ENOSPC 时把 pending 的 mkdir/strm 经
   `/mnt/cache/media` 落盘。
+
+## 定向目录扫描：用插件的 /run_roots（1.5.11+）
+
+av_auto 负责 115 离线暂存（`/av-auto`）的抽帧、终审、promote；**已落在正式库 `/AV` 但缺本地 strm 的目录**，不要临时改 `cloud_paths`，直接调插件接口：
+
+```bash
+curl -X POST "http://<moviepilot>:3000/api/v1/plugin/Av115Scraper/run_roots" \
+  -H "X-API-KEY: <token>" -H 'Content-Type: application/json' \
+  -d '{"roots":["/AV/SSIS-001","/AV/EBOD-531"]}'
+```
+
+- 不修改插件配置；`/AV` 列表 60 秒缓存（move/rename/mkdir 失效），多目录扫描更快。
+- 便捷脚本（本机运维）：`python3 /workspace/ops/scan_roots.py /AV/X /AV/Y`。
+- 注意：`/run_roots` 直接走插件路径，不经过 av_auto 的 review 门；审核拦截的番号不要用它补入库。
