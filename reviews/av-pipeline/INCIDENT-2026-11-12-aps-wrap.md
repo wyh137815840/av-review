@@ -67,3 +67,34 @@ docker exec moviepilot python3 /tmp/verify_fix.py       # list_children /AV -> 5
 # promote 验证
 docker exec moviepilot python3 /config/scripts/av_auto.py promote --dry-run SNOS-452
 ```
+
+## 后续修复（2026-11-12 09:00 前完成）
+
+### 1) aps 大目录兜底 + `library-scan` 重启
+
+- `Pan115.list_children` 增加 **web `/files` 兜底**：aps 返回的 `count` 是目录总条目数；当 aps 只取到 `len < count` 时，用 `https://webapi.115.com/files`（`limit=1000`、正常 offset 分页、`count` 是总数、行结构与 aps 相同的 `n/fid/cid/fc/pc/s`）补齐。生产 `/AV` 实测从 500 项变为 **504 项（全量、无重复）**。
+- 回归测试：新增 503 项与 2500 项目录用例；`python3 -m unittest discover -s tests` → **55 用例通过**（含原 51 + 分页 4 个）。
+- `library-scan` 重启：官方 corpus producer 不在仓库/Unraid 上，本次按同一 TSV 协议（`T\tcode\tverdict\terotic` / `E\tcode\turl` / `M\tcode\turl`）从 findav DB 重建 corpus（2899 T + 2910 E + 377 M，mode 600，读后即删），用 `AV_AUTO_CORPUS_FILE` 启动。新进程 PID 243642 正常运行，`progress.json` 恢复（already_reviewed 421、remaining 2439），后续 `review SONE-049` 正常完成。
+
+### 2) P0-C（review 假成功）修复（生产 `av_auto.py`）
+
+- `_complete_review`：要求 `review.json` 的每个 `REVIEW_MODELS` 行 `ok is True`、verdict 合法、且 `complete is not False`；否则视为「未审」，下次重跑。
+- `cmd_review`：任一模型调用失败时写 `agreement=incomplete`、`complete=false`、`incomplete_models=[...]`，保留现场但**返回非 0**，不再被当成完成。
+- `_grok_already_done`：要求 `grok.ok is True` 且 `complete is not False`；Grok 调用失败不再算「已跑过」。
+- `cmd_grok_review`：Grok 失败时留档 `grok_review.json`（审计用）但返回非 0，不 promote。
+- 备份：`/config/scripts/backups/av_auto.py.bak-p0c-20261112-004110`；部署后 `md5=9f4c8a066582e6e5b2d54ff5f7264d63`。
+- 容器内定向测试：双模型 503 → `rc=1`、`agreement=incomplete`、`complete=False`、`_complete_review` 拒绝；正常 pass → `rc=0`、`complete=True`；Grok 失败 → `_grok_already_done=False`；存量 pass review（SNOS-437）仍被接受。
+- 生产实证：补丁后新审的 `SONE-049/review.json` 已带 `complete=True`，说明流水线在用新代码。
+
+### 3) 发版（mp-115 → 1.5.9）
+
+- 分支 `fix/aps-pagination-wrap`，PR **#5 已合并**：`0ef9fb1 Merge pull request: Av115Scraper 1.5.9 aps pagination`。
+- `plugin_version` / `package.v2.json` 升至 **1.5.9**，history 记录本次修复；版本一致性测试改为动态比对（不再硬编码 1.5.8）。
+- 生产两份插件副本（`/app/app/plugins` 与 `/config/plugins`）均已更新到 1.5.9 并 reload；`GET /api/v1/plugin/` 显示 `Av115Scraper 1.5.9, state=True`。
+
+### 更新后的残留风险
+
+1. web `/files` 兜底在 >1200 项目录上的真实表现尚未用生产大目录验证（本次只验证了 503 项；接口每页 1000，理论可分页，建议下次遇到 >1200 目录时观察日志「web 兜底取到 N 项」）。
+2. `av_auto` 的 P0-C 补丁目前只在**生产副本**，av-review GitHub 仓库主线落后生产约 1200 行；下次同步时要把这 4 处补丁一起带回仓库。
+3. 两份插件副本已同步 `av115_pan.py` + `__init__.py`，其余文件仍可能存在差异（部署漂移未根治）。
+4. `library-scan` 本次是用「从 DB 重建的 corpus」启动的；官方 producer（grokbot-vm / 仓外调度器）若对 corpus 有额外过滤，需要下次由它接续。
