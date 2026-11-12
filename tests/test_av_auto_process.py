@@ -181,7 +181,7 @@ class ProcessPipelineTests(unittest.TestCase):
             if not grok_trigger:
                 raise AssertionError("grok ran for a settled review")
             (Path(args.frames_dir) / "grok_review.json").write_text(
-                json.dumps({"code": args.code, "trigger": grok_trigger, "verdict": "fail"}),
+                json.dumps({"code": args.code, "trigger": grok_trigger, "verdict": "fail", "grok": {"ok": True}}),
                 encoding="utf-8",
             )
             return 0
@@ -627,7 +627,7 @@ class DurableFramesTests(unittest.TestCase):
         def fake_grok(args):
             calls.append(("grok", args.code, str(args.frames_dir)))
             (Path(args.frames_dir) / "grok_review.json").write_text(
-                json.dumps({"code": args.code, "trigger": "disagree", "verdict": "fail", "role": "tiebreak"}),
+                json.dumps({"code": args.code, "trigger": "disagree", "verdict": "fail", "role": "tiebreak", "grok": {"ok": True}}),
                 encoding="utf-8",
             )
             return 0
@@ -703,7 +703,7 @@ class DurableFramesTests(unittest.TestCase):
                 grok = None
                 if code == "ABP-246":
                     review = _review(code, "uncertain", "uncertain", "agree", "uncertain")
-                    grok = {"code": code, "trigger": "uncertain", "verdict": "pass"}
+                    grok = {"code": code, "trigger": "uncertain", "verdict": "pass", "grok": {"ok": True}}
                 self._seed(scratch / code, code, review, grok)
             expected = {
                 code: (scratch / code / "review.json").read_bytes()
