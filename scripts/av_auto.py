@@ -113,7 +113,7 @@ SUBMIT_GAP_SEC = int(os.environ.get("AV_AUTO_SUBMIT_GAP", "48"))
 WAIT_POLL_SEC = int(os.environ.get("AV_AUTO_WAIT_POLL", "20"))
 SEEK_START = 120          # 2 minutes
 SEEK_STEP = 480           # 8 minutes
-SEEK_MAX_FRAMES = 8
+SEEK_MAX_FRAMES = 16
 SEEK_TAIL_GUARD = 90      # avoid end credits
 SEEK_DEDUP = 30
 PRECHECK_RETRIES = 3      # plus the first attempt
@@ -1053,8 +1053,8 @@ def _t85(duration: float) -> float:
 
 
 def seek_points(duration: float | None) -> tuple[list[tuple[str, int]], dict]:
-    """Dense default: from 2min every ~8min, plus ~85% (avoid credits), max 8."""
-    meta = {"capped": False, "grid": 0, "rule": "dense_2min_8min_85pct"}
+    """Dense default: 2min start, evenly spaced to ~85% (avoid credits), max 16 frames."""
+    meta = {"capped": False, "grid": 0, "rule": "dense_2min_85pct_max16"}
     if not duration or duration <= 10:
         return [], meta
     pts: list[tuple[str, int]] = []
@@ -1072,14 +1072,24 @@ def seek_points(duration: float | None) -> tuple[list[tuple[str, int]], dict]:
         return pts, meta
 
     t85 = _t85(duration)
+    # Reserve one slot for the 85% anchor and distribute the rest evenly over
+    # the whole movie. 16 frames means 15 grid points + the 85% point.
+    n_grid = SEEK_MAX_FRAMES - 1
+    span = max(0.0, t85 - SEEK_START)
     raw_grid: list[int] = []
-    t = float(SEEK_START)
-    while t < duration - 1:
-        ss = int(round(t))
-        if ss <= duration - SEEK_TAIL_GUARD and ss < t85 - SEEK_DEDUP:
+    if span <= 0:
+        raw_grid = [SEEK_START]
+    else:
+        step = span / n_grid
+        for i in range(n_grid):
+            ss = int(round(SEEK_START + i * step))
+            if ss > duration - SEEK_TAIL_GUARD:
+                break
+            if ss >= t85 - SEEK_DEDUP:
+                break
+            if raw_grid and ss - raw_grid[-1] < SEEK_DEDUP:
+                continue
             raw_grid.append(ss)
-        t += SEEK_STEP
-    # reserve 1 slot for 85%
     meta["grid"] = len(raw_grid)
     meta["capped"] = (len(raw_grid) + 1) > SEEK_MAX_FRAMES
     for ss in raw_grid[: SEEK_MAX_FRAMES - 1]:
@@ -1624,7 +1634,7 @@ def cmd_frames(args) -> int:
                 shutil.rmtree(out, ignore_errors=True)
             return 1
         labels = ", ".join(f"{l}@{ss}s" for l, ss in pts)
-        cap_note = " 触顶8帧" if meta.get("capped") else ""
+        cap_note = f" 触顶{SEEK_MAX_FRAMES}帧" if meta.get("capped") else ""
         print(f"seek: {labels}{cap_note}")
         if precheck:
             print(f"precheck: {llm['precheck_model']} 一家；无效则在该点附近重抽，单点最多 {PRECHECK_RETRIES} 次")
@@ -3833,7 +3843,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("codes", nargs="+")
     s.set_defaults(func=cmd_strm)
 
-    s = sub.add_parser("frames", help="对正片 strm 加密抽帧：2分钟起每约8分钟一帧，再补约85%%，最多8帧有效帧；默认预检无效则重抽")
+    s = sub.add_parser("frames", help="对正片 strm 加密抽帧：2分钟起均匀取点到约85%%，最多16帧有效帧；默认预检无效则重抽")
     s.add_argument("code", nargs="?", default="")
     s.add_argument("--strm", default="", help="直接指定 strm 路径")
     s.add_argument("--out", default="", help="帧输出目录，默认持久目录 /config/scripts/av-auto-fs/frames/<番号>")
