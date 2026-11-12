@@ -46,7 +46,7 @@ av_auto process ABP-073 ABP-108 ABP-246 ABP-313 ABP-383
 
 `av_auto process --help` 也印出上面这条命令。
 
-顺序固定为 clean → strm → frames → review → grok-review。清杂质规则与单独的 `clean` 相同（只留大体积正片，UC/AI/4K 变体可留，广告/apk/宣传/过小 sample 删掉）。抽帧仍是约 2 分钟起、每约 8 分钟一帧、再补约 85%，最多 8 帧，并且默认做有效性预检；没人或完全不色的帧会重抽，仍无效则丢弃，不送终审。终审仍是 DeepSeek-flash + gpt-6-luna。只有 uncertain 或两家分歧才调用 `grok-review`，写同目录 `grok_review.json`，不覆盖 `review.json`。
+顺序固定为 clean → strm → frames → review → grok-review。清杂质规则与单独的 `clean` 相同（只留大体积正片，UC/AI/4K 变体可留，广告/apk/宣传/过小 sample 删掉）。抽帧仍是约 2 分钟起、均匀取点至约 85%，最多 16 帧，并且默认做有效性预检；没人或完全不色的帧会重抽，仍无效则丢弃，不送终审。终审仍是 DeepSeek-flash + gpt-6-luna。只有 uncertain 或两家分歧才调用 `grok-review`，写同目录 `grok_review.json`，不覆盖 `review.json`。
 
 帧、`review.json` 和若有的 `grok_review.json` 在命令报完成之前写入持久目录 `/config/scripts/av-auto-fs/frames/<番号>/`（宿主机 `/mnt/user/appdata/moviepilot/config/scripts/av-auto-fs/frames/<番号>/`）。容器里的 `/tmp/av-auto-frames/<番号>/` 不会单独算完成；写不进持久目录就是 FAIL。下一轮 process 复用这份持久结果。`frames` / `review` / `grok-review` 单独跑完也会落到同一目录。
 
@@ -67,7 +67,7 @@ av_auto ABP-073 process
 
 清杂质：只保留 ≥ min_size_mb（默认 300）的正片大视频（UC/AI/4K 等正片变体可留）；广告包、apk、宣传图、过小 sample/预告/trailer、文件名带广告/推广、嵌套垃圾夹全删。inbox 里若没有达标正片则不搬不删，便于排查。
 
-抽帧：从 2 分钟起约每 8 分钟一帧，再补约 85%（避开片尾），单部最多 8 帧有效帧；某一处 seek 过慢则降级跳过，不堵整批。HTTP(S) 上的 fragmented MP4（ftyp + 很小的 moov/mvex + 一串 moof/mdat）不再把 URL 直接交给 `ffmpeg -ss`。那条路径会发不闭合的 `Range: bytes=offset-`，并按渐进式整段 moov 去 seek，源上会报 `partial file`、一个包都写不出；只用闭合 Range 把开头约 2MB 下到本地却能解出帧。`av_auto.py` 与同目录的 `fmp4_http.py` 改成闭合 Range：跟随 redirect 并保住 cookie，用 sidx 或文件尾 mfra（都没有就只读 moof 头、跳过 mdat）定位时间点，只取对应 moof/mdat；分片过大或 sample 偏移是绝对文件位置时，只取该 GOP 的 sample 再在本地拼一个小片段。不整文件下载。默认用 DeepSeek-flash 一家做有效性预检：完全没人或完全不色（空景/字幕/胡聊等）判无效，在该点附近换时间重抽，单点最多再试 3 次，仍无效则丢弃该点，不送双模型终审。看不清或预检调用失败先当作有效交给终审，避免误杀。`--cleanup` 删临时帧，保留时间点清单。终审仍是 DeepSeek-flash + gpt-6-luna，不上 MiniMax/Grok，不改 media_llm_route。uncertain 或两家分歧时另跑 `grok-review`，不要把 Grok 放进默认 `review`。Magpie Key 由入口脚本临时放入运行时文件，用完删除，不入库。
+抽帧：从 2 分钟起均匀取点到约 85%（避开片尾），单部最多 16 帧有效帧；某一处 seek 过慢则降级跳过，不堵整批。HTTP(S) 上的 fragmented MP4（ftyp + 很小的 moov/mvex + 一串 moof/mdat）不再把 URL 直接交给 `ffmpeg -ss`。那条路径会发不闭合的 `Range: bytes=offset-`，并按渐进式整段 moov 去 seek，源上会报 `partial file`、一个包都写不出；只用闭合 Range 把开头约 2MB 下到本地却能解出帧。`av_auto.py` 与同目录的 `fmp4_http.py` 改成闭合 Range：跟随 redirect 并保住 cookie，用 sidx 或文件尾 mfra（都没有就只读 moof 头、跳过 mdat）定位时间点，只取对应 moof/mdat；分片过大或 sample 偏移是绝对文件位置时，只取该 GOP 的 sample 再在本地拼一个小片段。不整文件下载。默认用 DeepSeek-flash 一家做有效性预检：完全没人或完全不色（空景/字幕/胡聊等）判无效，在该点附近换时间重抽，单点最多再试 3 次，仍无效则丢弃该点，不送双模型终审。看不清或预检调用失败先当作有效交给终审，避免误杀。`--cleanup` 删临时帧，保留时间点清单。终审仍是 DeepSeek-flash + gpt-6-luna，不上 MiniMax/Grok，不改 media_llm_route。uncertain 或两家分歧时另跑 `grok-review`，不要把 Grok 放进默认 `review`。Magpie Key 由入口脚本临时放入运行时文件，用完删除，不入库。
 
 ## Grok 复审
 
