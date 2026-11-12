@@ -101,3 +101,23 @@ if hook:
 - 只通过插件公开门面 `av115_api`（`API_VERSION=1`，需要 Av115Scraper **>= 1.5.10**）访问 `open_pan`、`safe_name`、`write_library`、`item_id/name/is_dir/size` 等。
 - 插件目录按顺序解析：`AV_AUTO_PLUGIN_DIR` → MoviePilot 实际安装副本 `/app/app/plugins/av115scraper` → 旧本地副本（仅兼容）。
 - 门面版本过旧或缺失时会直接报错，不再静默 import 失败。
+
+## 仓库与生产同步（2026-11-12）
+
+本仓库的 `scripts/av_auto.py` 与 `scripts/library_scan.py` 已与 Unraid 生产副本
+`/mnt/user/appdata/moviepilot/config/scripts/` 同步，包含：
+
+- **`av_auto library-scan`**：findav 库全量调度（corpus 由 `AV_AUTO_CORPUS_FILE` 传入，
+  读后即删；不刮削、不 promote，抽帧/终审/未决 Grok 与 process 同一套）。
+- **auto-promote 开关**：`/config/scripts/av-auto-fs/auto_promote.on`（空文件/on/1/true/yes 开；
+  缺失或 off/0/false/no 关；`AV_AUTO_AUTO_PROMOTE` 可覆盖）。只有终审 pass（或 Grok
+  tiebreak kept_verdict=pass）才走官方 promote。
+- **review 完整性**：模型调用失败写 `complete=false`/`incomplete_models` 并返回非 0，
+  不会被当成已完成；Grok 失败同理。
+
+新增两个入口脚本：
+
+- `bin/av_auto.unraid`：Unraid 侧入口（把 Magpie caller-keys 临时复制为
+  `llm_runtime.json`，docker exec moviepilot 执行，退出后跑 `av_auto_apply_fs`）。
+- `bin/av_auto_apply_fs`：`/media` ENOSPC 时把 pending 的 mkdir/strm 经
+  `/mnt/cache/media` 落盘。
