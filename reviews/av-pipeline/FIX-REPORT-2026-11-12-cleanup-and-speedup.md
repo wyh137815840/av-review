@@ -46,3 +46,13 @@
 
 - 后续定向扫描统一用 `/run_roots`（或 `av115_api`），不要再临时改 `cloud_paths`；如需 dry-run/覆盖开关可按需扩展该接口参数。
 - 缓存只在单个进程内生效，且写操作会立即失效；对「扫描大量 root」提速明显，对单目录行为无变化。
+
+## 5. 后续落实（10:30–10:50）
+
+- **删除 115 `/_cleanup_20261112`**：二次确认 22 个条目均无视频后逐条删除，最后删除目录本身；`_web_getid("/_cleanup_20261112")` 返回 GONE，`/AV` 当前 544 个目录，云端无残留。
+- **`IPZZ-003` / `IPX-528` 决策：不入库**。两者 review 都是两家模型一致 `fail`（原因均为「狰狞/难受表情」），没有 Grok 分歧；按要求保持 review 拦截，不写本地 strm/Emby。云端原片与 `/av-auto` 副本保留，供人工复核。
+- **`/run_roots` 固化**：
+  - 本机新增运维脚本 `/workspace/ops/scan_roots.py`（POST `/run_roots` → 轮询 → 打印 status），已用不存在目录验证失败路径输出。
+  - `/workspace/ops/README.md` 更新到 1.5.11 现状，并写入「定向扫描统一用 `/run_roots`，不要临时改 `cloud_paths`」。
+  - 文档 PR：mp-115 #8（README 增加 `/run_roots` 用法）、av-review #4（bin/av_auto.README 增加定向补 strm 说明，并注明它不经过 av_auto review 门）。
+- 当前状态：插件 1.5.11；library-scan 运行中（PID 243642，约 3h20m）；frames 524、auto_promote ON；Emby 570；本地 strm 目录 646；`/AV` 544。
