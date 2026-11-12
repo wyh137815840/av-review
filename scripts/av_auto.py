@@ -2348,42 +2348,46 @@ def cmd_grok_review(args) -> int:
 
 
 def _emby_refresh(paths: dict, dest: Path) -> str:
+    import os
+
     import httpx
 
     host, key = _emby_auth()
     headers = {"X-Emby-Token": key, "Content-Type": "application/json"}
     notes = []
     with httpx.Client(timeout=30.0) as client:
-        # Tell Emby the new/updated folder appeared.
+        # 只通知 Emby 这个路径新增/变更。默认不再递归刷新整个媒体库：
+        # 每次 promote 全库 Refresh 会让 PlaybackInfo 排队，首次播放要等几十秒。
         r = client.post(
             f"{host}/Library/Media/Updated",
             headers=headers,
             json={"Updates": [{"Path": str(dest), "UpdateType": "Created"}]},
         )
         notes.append(f"Media/Updated {r.status_code}")
-        libs = client.get(f"{host}/Library/VirtualFolders", headers=headers)
-        item_id = ""
-        wanted = paths["emby_library"].casefold()
-        if libs.status_code == 200:
-            for lib in libs.json() or []:
-                if str(lib.get("Name") or "").casefold() == wanted:
-                    item_id = str(lib.get("ItemId") or lib.get("Guid") or lib.get("Id") or "")
-                    break
-        if item_id:
-            r2 = client.post(
-                f"{host}/Items/{item_id}/Refresh",
-                headers=headers,
-                params={
-                    "Recursive": "true",
-                    "MetadataRefreshMode": "Default",
-                    "ImageRefreshMode": "Default",
-                    "ReplaceAllMetadata": "false",
-                    "Reload": "true",
-                },
-            )
-            notes.append(f"Refresh {paths['emby_library']} {r2.status_code}")
-        else:
-            notes.append(f"未找到 Emby 库 {paths['emby_library']}，只做了路径通知")
+        if os.environ.get("AV_AUTO_EMBY_FULL_REFRESH") == "1":
+            libs = client.get(f"{host}/Library/VirtualFolders", headers=headers)
+            item_id = ""
+            wanted = paths["emby_library"].casefold()
+            if libs.status_code == 200:
+                for lib in libs.json() or []:
+                    if str(lib.get("Name") or "").casefold() == wanted:
+                        item_id = str(lib.get("ItemId") or lib.get("Guid") or lib.get("Id") or "")
+                        break
+            if item_id:
+                r2 = client.post(
+                    f"{host}/Items/{item_id}/Refresh",
+                    headers=headers,
+                    params={
+                        "Recursive": "true",
+                        "MetadataRefreshMode": "Default",
+                        "ImageRefreshMode": "Default",
+                        "ReplaceAllMetadata": "false",
+                        "Reload": "true",
+                    },
+                )
+                notes.append(f"Refresh {paths['emby_library']} {r2.status_code}")
+            else:
+                notes.append(f"未找到 Emby 库 {paths['emby_library']}，只做了路径通知")
     return "; ".join(notes)
 
 
