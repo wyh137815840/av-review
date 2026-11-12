@@ -1715,8 +1715,13 @@ def cmd_review(args) -> int:
             "usage": rec.get("usage") or {},
         }
         print(f"  {model}: {verdict} {models[model]['reason']}".rstrip())
+    failed_models = [m for m in llm["review_models"] if not models[m].get("ok")]
     vs = [models[m]["verdict"] for m in llm["review_models"]]
-    if vs and all(v == vs[0] for v in vs):
+    if failed_models:
+        # 调用失败不是「两家一致 uncertain」：明确标成 incomplete，便于重跑。
+        agreement = "incomplete"
+        consensus = "uncertain"
+    elif vs and all(v == vs[0] for v in vs):
         agreement = "agree"
         consensus = vs[0]
     elif "fail" in vs and "pass" in vs:
@@ -1734,6 +1739,8 @@ def cmd_review(args) -> int:
         "models": models,
         "agreement": agreement,
         "consensus": consensus,
+        "complete": not failed_models,
+        "incomplete_models": failed_models,
         "cost": cost,
         "started_at": started.isoformat(),
         "finished_at": datetime.now(TZ).isoformat(),
@@ -1741,6 +1748,15 @@ def cmd_review(args) -> int:
     }
     dest = out / "review.json"
     dest.write_text(json.dumps(result, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")
+    if failed_models:
+        # 保留失败现场供排查，但不当作已完成；返回非 0 让调用方重试。
+        _persist_frames_dir(code, out)
+        print(
+            f"FAIL review {code}: {len(failed_models)}/{len(llm['review_models'])} 个模型调用失败 "
+            f"({', '.join(_model_short(m) for m in failed_models)})，review.json 标记 complete=false，下次重跑",
+            file=sys.stderr,
+        )
+        return 1
     if _persist_frames_dir(code, out, require_review=True) != 0:
         return 1
     official_review = _durable_frames_dir(code) / "review.json"
@@ -2136,6 +2152,14 @@ def cmd_grok_review(args) -> int:
     written = _write_grok_review(out, doc, str(llm.get("key") or ""))
     if review_path.read_bytes() != before:
         _die("review.json 被改动")
+    if grok.get("ok") is not True:
+        # 失败尝试留档，但不落成完成态；下次 process 会重跑。
+        _persist_frames_dir(code, out)
+        print(
+            f"FAIL grok-review {code}: Grok 调用/解析失败（http={grok.get('http')}），不计为已完成",
+            file=sys.stderr,
+        )
+        return 1
     if _persist_frames_dir(code, out) != 0:
         return 1
     if review_path.read_bytes() != before:
@@ -2718,7 +2742,13 @@ def _frames_ready(folder: Path) -> bool:
 
 
 def _complete_review(folder: Path) -> dict | None:
-    """Dual-model review.json, or None when final review still has to run."""
+    """Dual-model review.json, or None when final review still has to run.
+
+    A file that exists is not proof the review ran: when the Magpie call fails,
+    cmd_review still writes rows with ok=False and verdict=uncertain. Treat
+    that (and any complete=false document) as not reviewed so a later run
+    retries instead of skipping forever.
+    """
     path = folder / "review.json"
     if not path.is_file():
         return None
@@ -2728,9 +2758,18 @@ def _complete_review(folder: Path) -> dict | None:
         return None
     if not isinstance(doc, dict):
         return None
+    if doc.get("complete") is False:
+        return None
     prior = prior_model_verdicts(doc)
     if not set(REVIEW_MODELS).issubset(prior):
         return None
+    models = doc.get("models") if isinstance(doc.get("models"), dict) else {}
+    for model in REVIEW_MODELS:
+        row = models.get(model)
+        if not isinstance(row, dict) or row.get("ok") is not True:
+            return None
+        if row.get("verdict") not in _VERDICTS:
+            return None
     return doc
 
 
@@ -2747,7 +2786,13 @@ def _grok_already_done(folder: Path, trigger: str, code: str) -> bool:
     recorded = _norm_code(str(doc.get("code") or ""))
     if recorded and recorded != code:
         return False
+    if doc.get("complete") is False:
+        return False
     if str(doc.get("trigger") or "") != trigger:
+        return False
+    grok = doc.get("grok") if isinstance(doc.get("grok"), dict) else {}
+    if grok.get("ok") is not True:
+        # 调用失败也写过 grok_review.json；不能把它当成 "Grok 已跑过"。
         return False
     return doc.get("verdict") in _VERDICTS
 
