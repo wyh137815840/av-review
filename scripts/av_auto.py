@@ -46,7 +46,49 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 from fmp4_http import Fmp4RangeError, open_fmp4_session
 
-PLUGIN_DIR = Path("/config/plugins/av115scraper")
+# 插件目录：优先 MoviePilot 实际安装副本，其次环境变量/旧的本地副本。
+# 外部工具只通过插件公开门面 av115_api 访问，不再直接 import 内部模块。
+PLUGIN_DIR_CANDIDATES = tuple(
+    path for path in (
+        Path(os.environ["AV_AUTO_PLUGIN_DIR"]).expanduser() if os.environ.get("AV_AUTO_PLUGIN_DIR") else None,
+        Path("/app/app/plugins/av115scraper"),
+        Path("/config/plugins/av115scraper"),
+    ) if path is not None
+)
+REQUIRED_AV115_API = 1
+
+
+def _plugin_dir() -> Path:
+    for candidate in PLUGIN_DIR_CANDIDATES:
+        try:
+            if candidate.is_dir() and (candidate / "av115_api.py").is_file():
+                return candidate
+        except OSError:
+            continue
+    raise RuntimeError(
+        "找不到 av115 插件门面（av115_api.py）：请在 MoviePilot 安装/启用 Av115Scraper >= 1.5.10，"
+        "或设置 AV_AUTO_PLUGIN_DIR 指向插件目录"
+    )
+
+
+def _add_plugin_path() -> Path:
+    path = _plugin_dir()
+    text = str(path)
+    if text not in sys.path:
+        sys.path.insert(0, text)
+    return path
+
+
+def _load_av115_api():
+    _add_plugin_path()
+    import av115_api
+
+    version = int(getattr(av115_api, "API_VERSION", 0) or 0)
+    if version < REQUIRED_AV115_API:
+        raise RuntimeError(
+            f"av115_api 版本过旧：{version} < {REQUIRED_AV115_API}，请更新 Av115Scraper 插件"
+        )
+    return av115_api
 USER_DB = Path(os.environ.get("MP_USER_DB", "/config/user.db"))
 STAGING_115_DEFAULT = "/av-auto"
 STAGING_STRM = Path("/media/av-auto")
@@ -601,11 +643,9 @@ def _paths(cfg: dict | None = None) -> dict:
 
 
 def _import_plugin():
-    sys.path.insert(0, str(PLUGIN_DIR))
-    from av115_library import build_play_url, destination, find_existing, safe_name, write_library
-    from av115_pan import Pan115
-
-    return Pan115, build_play_url, destination, find_existing, safe_name, write_library
+    api = _load_av115_api()
+    return (api.open_pan, api.build_play_url, api.destination,
+            api.find_existing, api.safe_name, api.write_library)
 
 
 def _pan():
@@ -650,13 +690,13 @@ def _is_keeper(name: str, size: int, min_bytes: int) -> bool:
 
 
 def _item_fields(item: dict) -> tuple[str, str, bool, int, str]:
-    from av115_pan import _file_id, _is_directory, _name, _size
+    api = _load_av115_api()
 
-    name = _name(item)
-    fid = _file_id(item)
-    is_dir = _is_directory(item)
-    size = _size(item)
-    pc = str(item.get("pc") or item.get("pickcode") or item.get("pick_code") or "")
+    name = api.item_name(item)
+    fid = api.item_id(item)
+    is_dir = api.item_is_dir(item)
+    size = api.item_size(item)
+    pc = api.item_pickcode(item)
     return name, fid, is_dir, size, pc
 
 
@@ -678,13 +718,13 @@ def _child_names(pan, directory_id: str) -> list[tuple[str, bool, str]]:
     for item in pan.list_children(directory_id):
         name = str(item.get("n") or item.get("name") or item.get("fn") or "")
         fid = str(item.get("fid") or item.get("cid") or item.get("id") or item.get("file_id") or "")
-        # _is_directory / _name / _file_id live in av115_pan
+        # 只经公开门面读取字段；插件不在时退回原始字段。
         try:
-            from av115_pan import _file_id, _is_directory, _name
+            api = _load_av115_api()
 
-            name = _name(item)
-            fid = _file_id(item)
-            is_dir = _is_directory(item)
+            name = api.item_name(item)
+            fid = api.item_id(item)
+            is_dir = api.item_is_dir(item)
         except Exception:
             is_dir = bool(item.get("fid") in (None, "", "0") or item.get("fc") == "0" or item.get("is_dir"))
         if name:
@@ -1364,8 +1404,8 @@ def _extract_one(media: str, dest: Path, ss: int, session=None) -> dict:
 
 
 def _find_strm_for_code(code: str, paths: dict) -> Path | None:
-    sys.path.insert(0, str(PLUGIN_DIR))
-    from av115_library import safe_name
+    _add_plugin_path()
+    from av115_api import safe_name
 
     name = safe_name(code)
     candidates = [
@@ -2820,8 +2860,8 @@ def _staging_strm_ready(code: str) -> bool:
     paths = _paths()
     name = code
     try:
-        sys.path.insert(0, str(PLUGIN_DIR))
-        from av115_library import safe_name
+        _add_plugin_path()
+        from av115_api import safe_name
 
         name = safe_name(code) or code
     except Exception:

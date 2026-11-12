@@ -93,3 +93,11 @@ if hook:
 ```
 
 约束：用 p115client，不用 CloudDrive2；不改 media_llm_route；不刮削。验证条不要自动 promote。
+
+## 插件接口（2026-11-12 起）
+
+`av_auto` 不再直接 import 插件的内部模块，也不再使用 `/config/plugins/av115scraper` 旧副本：
+
+- 只通过插件公开门面 `av115_api`（`API_VERSION=1`，需要 Av115Scraper **>= 1.5.10**）访问 `open_pan`、`safe_name`、`write_library`、`item_id/name/is_dir/size` 等。
+- 插件目录按顺序解析：`AV_AUTO_PLUGIN_DIR` → MoviePilot 实际安装副本 `/app/app/plugins/av115scraper` → 旧本地副本（仅兼容）。
+- 门面版本过旧或缺失时会直接报错，不再静默 import 失败。
