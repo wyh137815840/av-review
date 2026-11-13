@@ -482,9 +482,9 @@ def classify_submit_text(text: str) -> str:
     cleaned = redact(text or "")
     if any(marker in cleaned for marker in _BLOCK_MARKERS):
         return "block"
-    if re.search(r"(?<!\d)911(?!\d)", cleaned):
+    if re.search(r"(?<![\w\]])911(?![\w])", cleaned):
         return "block"
-    if re.search(r"(?<!\d)406(?!\d)", cleaned):
+    if re.search(r"(?<![\w\]])406(?![\w])", cleaned):
         return "backoff"
     return ""
 

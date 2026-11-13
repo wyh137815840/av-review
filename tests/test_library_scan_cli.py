@@ -30,5 +30,24 @@ class LibraryScanCliTests(unittest.TestCase):
             self.assertTrue(av_auto.auto_promote_enabled())
 
 
+class SubmitSignalTests(unittest.TestCase):
+    def test_911_inside_ed2k_hash_is_not_risk(self):
+        import library_scan
+        text = "0 0 aa47bc0912200fd911d4c0e1634c086e www.98T.la@259LUXU-1393_restored_wm.mp4 0"
+        self.assertEqual(library_scan.classify_submit_text(text), "")
+
+    def test_real_911_still_blocks(self):
+        import library_scan
+        self.assertEqual(library_scan.classify_submit_text("115 返回 911 疑似风控"), "block")
+
+    def test_406_backoff_still_works(self):
+        import library_scan
+        self.assertEqual(library_scan.classify_submit_text("115 HTTP 406"), "backoff")
+
+    def test_406_inside_hash_is_not_backoff(self):
+        import library_scan
+        self.assertEqual(library_scan.classify_submit_text("hash aa406bbccdd file.mp4"), "")
+
+
 if __name__ == "__main__":
     unittest.main()
